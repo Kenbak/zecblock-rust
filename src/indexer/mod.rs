@@ -834,6 +834,20 @@ impl Indexer {
             self.postgres.pool().clone(),
         ));
 
+        if let (Some(path), Some(url)) = (
+            self.config.orphan_capture_path.clone(),
+            self.config.zebra_grpc_url.clone(),
+        ) {
+            let network = self.config.network_name().to_owned();
+            tokio::spawn(async move {
+                if let Err(error) =
+                    crate::db::orphan_capture::run_capture(&url, &path, &network, None, None).await
+                {
+                    tracing::error!(%error, "candidate capture stopped; canonical indexing continues");
+                }
+            });
+        }
+
         let grpc_url = self.config.zebra_grpc_url.clone();
         let mut grpc_stream: Option<Streaming<BlockHashAndHeight>> = None;
         let mut failure_state_active = self.has_active_failure_state().await?;

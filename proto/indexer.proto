@@ -20,12 +20,16 @@ message BlockAndHash {
 
   // The encoded block data.
   bytes data = 2;
+
+  // Optional node-local receipt ordering, meaningful only within its session.
+  optional uint64 receipt_order = 3;
 };
 
 // Zakura v1.4.0: resume after tips already covered by the RPC catch-up path.
 // Hashes use display order, matching ChainTipChange.
 message NonFinalizedStateChangeRequest {
   repeated bytes chain_tip_hashes = 1;
+  optional string receipt_session = 2;
 };
 
 // Represents a change in the mempool.
