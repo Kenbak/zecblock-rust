@@ -71,6 +71,20 @@ enum Commands {
         timeout: u64,
     },
 
+    /// Capture non-finalized block evidence to an isolated bounded journal; no DB access
+    OrphanShadow {
+        #[arg(long)]
+        journal: std::path::PathBuf,
+        /// Minimum new unique blocks required for the trial to pass
+        #[arg(long, default_value = "2")]
+        events: u64,
+        #[arg(long, default_value = "240")]
+        timeout: u64,
+        /// Exercise reconnect/resume after this many new durable captures
+        #[arg(long)]
+        reconnect_after: Option<u64>,
+    },
+
     /// Show indexer status
     Status {
         /// Emit machine-readable JSON
@@ -321,6 +335,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Commands::Shadow { events, timeout } => {
             commands::shadow::verify_full_block_stream(&config, events, timeout).await?;
+        }
+        Commands::OrphanShadow {
+            journal,
+            events,
+            timeout,
+            reconnect_after,
+        } => {
+            if events == 0 || !(1..=900).contains(&timeout) || reconnect_after == Some(0) {
+                return Err("invalid shadow trial bounds".into());
+            }
+            let url = config
+                .zebra_grpc_url
+                .as_deref()
+                .ok_or("ZEBRA_GRPC_URL required")?;
+            let summary = db::orphan_capture::run_capture(
+                url,
+                &journal,
+                config.network_name(),
+                Some(std::time::Duration::from_secs(timeout)),
+                reconnect_after,
+            )
+            .await?;
+            println!("{}", serde_json::to_string_pretty(&summary)?);
+            if summary.new_blocks < events {
+                return Err(format!(
+                    "only {} new blocks captured; required {events}",
+                    summary.new_blocks
+                )
+                .into());
+            }
         }
         Commands::Status { json } => {
             commands::status::show_status(&config, json).await?;

@@ -92,6 +92,7 @@ pub async fn connect_block_stream_after_forks(
     client
         .non_finalized_state_change(proto::NonFinalizedStateChangeRequest {
             chain_tip_hashes: fork_tips,
+            receipt_session: None,
         })
         .await
         .map(|response| response.into_inner())

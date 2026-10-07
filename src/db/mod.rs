@@ -2,6 +2,7 @@
 
 pub mod grpc;
 pub mod observations;
+pub mod orphan_capture;
 pub mod postgres;
 pub mod rocks;
 pub mod rpc;

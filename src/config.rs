@@ -50,6 +50,9 @@ pub struct Config {
 
     /// Encoded blocks that may be prefetched while ordered writes commit.
     pub live_pipeline_capacity: usize,
+
+    /// Opt-in filesystem-only candidate capture. Never changes canonical/orphan DB rows.
+    pub orphan_capture_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -75,6 +78,7 @@ impl Default for Config {
             enable_full_block_grpc: false,
             block_spool_path: PathBuf::from("/var/lib/cipherscan-indexer/block-spool"),
             live_pipeline_capacity: 4,
+            orphan_capture_path: None,
         }
     }
 }
@@ -173,6 +177,13 @@ impl Config {
             }
         }
 
+        if env::var("ENABLE_ORPHAN_CAPTURE").as_deref() == Ok("true") {
+            config.orphan_capture_path = env::var("ORPHAN_CAPTURE_PATH")
+                .ok()
+                .filter(|path| !path.trim().is_empty())
+                .map(PathBuf::from);
+        }
+
         config
     }
 
@@ -194,5 +205,6 @@ mod tests {
         let config = Config::default();
         assert_eq!(config.network, Network::Mainnet);
         assert_eq!(config.batch_size, 1000);
+        assert!(config.orphan_capture_path.is_none());
     }
 }

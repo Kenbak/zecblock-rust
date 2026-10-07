@@ -49,6 +49,7 @@ impl Indexer for Node {
             .push(request.into_inner().chain_tip_hashes);
         Ok(Response::new(Box::pin(tokio_stream::iter([Ok(
             proto::BlockAndHash {
+                receipt_order: None,
                 hash: vec![9; 32],
                 data: vec![42],
             },
