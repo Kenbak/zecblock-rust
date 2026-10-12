@@ -1,13 +1,15 @@
 //! Experimental durable capture of node-validated non-finalized blocks.
 //!
-//! This journal never reads or writes PostgreSQL. It is not an orphan-rate
-//! source yet: "non-canonical at check" is a reversible observation. Full
-//! consensus verification is the serving node's responsibility; decoding and
-//! hash checks here establish payload integrity, not independent validity.
+//! Shadow mode uses only the journal. Continuous mode delivers it to PostgreSQL
+//! and removes files only after acknowledgement. Canonical status is compared
+//! by readers against the current indexed chain, never permanently assigned here.
+//! Consensus authority is the serving node; decoding/hash checks establish integrity.
 
 use super::grpc::proto::{indexer_client::IndexerClient, Empty, NonFinalizedStateChangeRequest};
 use super::ZebraRpc;
+use crate::{config::Network, indexer::TransactionParser};
 use serde::{Deserialize, Serialize};
+use sqlx::{postgres::PgPoolOptions, PgPool};
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -89,6 +91,8 @@ struct Health {
     connections: u64,
     heads: Vec<String>,
     receipt_session: Option<String>,
+    #[serde(default)]
+    head_heights: HashMap<String, u32>,
 }
 
 struct Journal {
@@ -280,6 +284,10 @@ impl Journal {
     }
 
     fn advance_head(&mut self, evidence: &Evidence) {
+        self.health.head_heights.remove(&evidence.parent);
+        self.health
+            .head_heights
+            .insert(evidence.hash.clone(), evidence.height);
         self.health
             .heads
             .retain(|hash| hash != &evidence.parent && hash != &evidence.hash);
@@ -290,6 +298,9 @@ impl Journal {
         {
             self.health.heads.push(evidence.hash.clone());
         }
+        self.health
+            .head_heights
+            .retain(|hash, _| self.health.heads.contains(hash));
         // Refuse excess heads at subscription time; never silently discard a fork.
     }
 
@@ -352,6 +363,30 @@ pub async fn run_capture(
     duration: Option<Duration>,
     reconnect_after: Option<u64>,
 ) -> Result<Summary, String> {
+    run_capture_inner(url, directory, network, duration, reconnect_after, None).await
+}
+
+/// Continuous collector: durable file buffer, transactional database delivery,
+/// then acknowledged-file removal. Never writes canonical chain/accounting tables.
+pub async fn run_live_capture(
+    url: &str,
+    directory: &Path,
+    network: &str,
+    database_url: &str,
+    observer: &str,
+) -> Result<Summary, String> {
+    let sink = DatabaseSink::new(database_url, observer, network)?;
+    run_capture_inner(url, directory, network, None, None, Some(sink)).await
+}
+
+async fn run_capture_inner(
+    url: &str,
+    directory: &Path,
+    network: &str,
+    duration: Option<Duration>,
+    reconnect_after: Option<u64>,
+    sink: Option<DatabaseSink>,
+) -> Result<Summary, String> {
     let rpc = ZebraRpc::from_env()?;
     let info = rpc.get_blockchain_info().await?;
     if info.get("chain").and_then(|v| v.as_str())
@@ -372,6 +407,10 @@ pub async fn run_capture(
     let mut reconnects = 0;
     let mut forced_reconnect = false;
     let mut persist_max_ms: f64 = 0.0;
+    if let Some(sink) = &sink {
+        // Recover committed files before reconnecting or accepting more blocks.
+        sink.try_flush(&mut journal).await?;
+    }
     loop {
         if deadline.is_some_and(|d| tokio::time::Instant::now() >= d) {
             break;
@@ -406,6 +445,22 @@ pub async fn run_capture(
                 );
             }
             drop(check);
+            if sink.is_some() {
+                // Only retire heads far behind the serving node, never recent forks.
+                // A reconnect after this horizon remains explicitly incomplete.
+                let floor = tip.height.saturating_sub(500);
+                let stale: Vec<_> = journal
+                    .health
+                    .head_heights
+                    .iter()
+                    .filter(|(_, height)| **height < floor)
+                    .map(|(hash, _)| hash.clone())
+                    .collect();
+                for hash in stale {
+                    journal.health.heads.retain(|head| head != &hash);
+                    journal.health.head_heights.remove(&hash);
+                }
+            }
             if journal.health.heads.is_empty() {
                 // Explicit initial baseline, not an assertion of past capture.
                 let mut tips = rpc.get_fork_tip_hashes().await?;
@@ -510,6 +565,9 @@ pub async fn run_capture(
                     CaptureEvent::Block(message, received) => (message, received),
                     CaptureEvent::Heartbeat => {
                         tokio::task::block_in_place(|| journal.save_health())?;
+                        if let Some(sink) = &sink {
+                            sink.try_flush(&mut journal).await?;
+                        }
                         continue;
                     }
                     CaptureEvent::Closed => break,
@@ -518,6 +576,9 @@ pub async fn run_capture(
                 let write_started = Instant::now();
                 if tokio::task::block_in_place(|| journal.store(evidence, &message.data))? {
                     new_blocks += 1;
+                }
+                if let Some(sink) = &sink {
+                    sink.try_flush(&mut journal).await?;
                 }
                 persist_max_ms = persist_max_ms.max(write_started.elapsed().as_secs_f64() * 1000.0);
                 if !forced_reconnect && reconnect_after.is_some_and(|n| new_blocks >= n) {
@@ -592,9 +653,281 @@ pub async fn run_capture(
     })
 }
 
+/// One connection, bounded statements and batches keep this separate from canonical ingestion.
+struct DatabaseSink {
+    pool: PgPool,
+    observer: String,
+    network: String,
+}
+
+impl DatabaseSink {
+    fn new(url: &str, observer: &str, network: &str) -> Result<Self, String> {
+        if observer.is_empty()
+            || observer.len() > 80
+            || !observer
+                .bytes()
+                .all(|c| c.is_ascii_alphanumeric() || b"-_".contains(&c))
+        {
+            return Err("invalid capture observer name".into());
+        }
+        let pool = PgPoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(Duration::from_secs(3))
+            .connect_lazy(url)
+            .map_err(|_| "invalid capture database configuration")?;
+        Ok(Self {
+            pool,
+            observer: observer.into(),
+            network: network.into(),
+        })
+    }
+
+    async fn try_flush(&self, journal: &mut Journal) -> Result<(), String> {
+        match tokio::time::timeout(Duration::from_secs(5), self.flush(journal)).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error))
+                if error.starts_with("capture file")
+                    || error.starts_with("capture health")
+                    || error == "capture database network mismatch" =>
+            {
+                Err(error)
+            }
+            _ => {
+                // Keep every unacknowledged file. Do not expose connection strings in logs.
+                tracing::warn!("capture database unavailable; retained blocks will be retried");
+                Ok(())
+            }
+        }
+    }
+
+    async fn flush(&self, journal: &mut Journal) -> Result<(), String> {
+        let records: Vec<_> = journal.records.values().take(32).cloned().collect();
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|_| "capture database unavailable")?;
+        sqlx::query("SET LOCAL statement_timeout = '3s'")
+            .execute(&mut *tx)
+            .await
+            .map_err(|_| "capture database setup")?;
+        sqlx::query("SET LOCAL lock_timeout = '500ms'")
+            .execute(&mut *tx)
+            .await
+            .map_err(|_| "capture database setup")?;
+        // Prevent accidentally delivering one network's evidence into the other's DB.
+        // Existing canonical genesis is the authority; an empty DB is not accepted.
+        let genesis: Option<String> =
+            sqlx::query_scalar("SELECT hash FROM blocks WHERE height = 0")
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|_| "capture database identity")?;
+        let expected = if self.network == "mainnet" {
+            "00040fe8ec8471911baa1db1266ea15dd06b4a8a5c453883c000b031973dce08"
+        } else {
+            "05a60a92d99d85997cce3b87616c089f6124d7342af37106edc76126334a2c38"
+        };
+        if genesis.as_deref() != Some(expected) {
+            return Err("capture database network mismatch".into());
+        }
+        sqlx::query("INSERT INTO block_capture_observers (observer,network,stream_connected,gaps,pending_records,last_gap,last_gap_at) VALUES ($1,$2,$3,$4,$5,$6,to_timestamp($7::double precision / 1000)) ON CONFLICT(observer) DO UPDATE SET heartbeat_at=now(),stream_connected=EXCLUDED.stream_connected,gaps=EXCLUDED.gaps,pending_records=EXCLUDED.pending_records,last_gap=EXCLUDED.last_gap,last_gap_at=EXCLUDED.last_gap_at WHERE block_capture_observers.network=EXCLUDED.network")
+            .bind(&self.observer).bind(&self.network).bind(journal.health.connected)
+            .bind(journal.health.gaps as i64).bind((journal.records.len()-records.len()) as i32)
+            .bind(&journal.health.last_gap).bind(journal.health.last_gap_at_ms.map(|v|v as f64))
+            .execute(&mut *tx).await.map_err(|_| "capture database observer")?;
+        for evidence in &records {
+            let path = journal.directory.join(format!("{}.capture", evidence.hash));
+            let bytes = tokio::fs::read(&path)
+                .await
+                .map_err(|_| "capture file read failed")?;
+            if bytes.len() < evidence.raw_bytes + 12 || &bytes[..8] != MAGIC {
+                return Err("capture file truncated or corrupt".into());
+            }
+            let raw = &bytes[bytes.len() - evidence.raw_bytes..];
+            let verified = decode(
+                &super::grpc::proto::BlockAndHash {
+                    hash: hex::decode(&evidence.hash).map_err(|_| "capture file hash invalid")?,
+                    data: raw.to_vec(),
+                    receipt_order: evidence.receipt_order,
+                },
+                evidence.received_at_ms,
+                evidence.receipt_session.clone(),
+            )?;
+            if verified.height != evidence.height
+                || verified.parent != evidence.parent
+                || verified.header_time != evidence.header_time
+            {
+                return Err("capture file metadata mismatch".into());
+            }
+            let block = Block::zcash_deserialize(&mut std::io::Cursor::new(raw))
+                .map_err(|_| "capture file decoding failed")?;
+            let network = if self.network == "mainnet" {
+                Network::Mainnet
+            } else {
+                Network::Testnet
+            };
+            let coinbase = block
+                .transactions
+                .first()
+                .ok_or("capture file missing coinbase")?;
+            let parsed = TransactionParser::from_chain_tx(
+                (**coinbase).clone(),
+                evidence.height,
+                &evidence.hash,
+                0,
+                network,
+            )?;
+            let miner = super::postgres::miner_address_candidate(
+                parsed.vout.first().and_then(|v| v.address.as_deref()),
+            );
+            let tag = parsed.vin.first().and_then(|v| v.script_sig.as_deref());
+            sqlx::query("INSERT INTO captured_blocks (hash,network,height,previous_block_hash,timestamp,first_seen_at,miner_address,coinbase_hex,raw_block) VALUES ($1,$2,$3,$4,$5,to_timestamp($6::double precision/1000),$7,$8,$9) ON CONFLICT(hash) DO UPDATE SET first_seen_at=LEAST(captured_blocks.first_seen_at,EXCLUDED.first_seen_at)")
+                .bind(&evidence.hash).bind(&self.network).bind(evidence.height as i64).bind(&evidence.parent)
+                .bind(evidence.header_time).bind(evidence.received_at_ms as f64).bind(miner).bind(tag).bind(raw)
+                .execute(&mut *tx).await.map_err(|_| "capture database block")?;
+            sqlx::query("INSERT INTO block_capture_receipts (observer,hash,received_at,receipt_session,receipt_order) VALUES ($1,$2,to_timestamp($3::double precision/1000),$4,$5) ON CONFLICT(observer,hash) DO NOTHING")
+                .bind(&self.observer).bind(&evidence.hash).bind(evidence.received_at_ms as f64)
+                .bind(&evidence.receipt_session).bind(evidence.receipt_order.and_then(|v| i64::try_from(v).ok()))
+                .execute(&mut *tx).await.map_err(|_| "capture database receipt")?;
+        }
+        // Keep metadata and all losing-branch bodies. Drop only redundant canonical
+        // bodies beyond the indexer's 500-block automatic reorg horizon, 64 per pass.
+        sqlx::query("WITH prune AS (SELECT c.hash FROM captured_blocks c JOIN blocks b ON b.height=c.height AND b.hash=c.hash WHERE c.raw_block IS NOT NULL AND c.height < (SELECT max(height)-500 FROM blocks) ORDER BY c.height LIMIT 64) UPDATE captured_blocks SET raw_block=NULL,raw_pruned=true FROM prune WHERE captured_blocks.hash=prune.hash")
+            .execute(&mut *tx).await.map_err(|_| "capture database retention")?;
+        tx.commit().await.map_err(|_| "capture database commit")?;
+        // The saved resume heads precede file deletion. Crash replay is harmless:
+        // primary keys preserve the original block and per-observer receipt.
+        tokio::task::block_in_place(|| journal.save_health())?;
+        for evidence in records {
+            let path = journal.directory.join(format!("{}.capture", evidence.hash));
+            let size = std::fs::metadata(&path)
+                .map_err(|_| "capture file metadata failed")?
+                .len();
+            std::fs::remove_file(path).map_err(|_| "capture file acknowledgement failed")?;
+            journal.bytes = journal.bytes.saturating_sub(size);
+            journal.records.remove(&evidence.hash);
+        }
+        std::fs::File::open(&journal.directory)
+            .and_then(|d| d.sync_all())
+            .map_err(|_| "capture file directory sync failed")?;
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn database_delivery_recovers_deduplicates_and_reclaims_only_acknowledged_files() {
+        let url = std::env::var("DATABASE_URL").expect("disposable DATABASE_URL required");
+        let path = directory();
+        let pool = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&url)
+            .await
+            .unwrap();
+        sqlx::raw_sql("CREATE TEMP TABLE blocks(height bigint PRIMARY KEY, hash text UNIQUE);
+            CREATE TEMP TABLE captured_blocks(hash text PRIMARY KEY,network text,height bigint,previous_block_hash text,timestamp bigint,first_seen_at timestamptz,miner_address text,coinbase_hex text,raw_block bytea,raw_pruned boolean DEFAULT false);
+            CREATE TEMP TABLE block_capture_observers(observer text PRIMARY KEY,network text,collection_started_at timestamptz DEFAULT now(),heartbeat_at timestamptz DEFAULT now(),stream_connected boolean,gaps bigint,pending_records integer,last_gap text,last_gap_at timestamptz);
+            CREATE TEMP TABLE block_capture_receipts(observer text, hash text REFERENCES captured_blocks(hash),received_at timestamptz,receipt_session text,receipt_order bigint,PRIMARY KEY(observer,hash));
+            INSERT INTO blocks VALUES (0,'00040fe8ec8471911baa1db1266ea15dd06b4a8a5c453883c000b031973dce08')")
+            .execute(&pool).await.unwrap();
+        let sink = DatabaseSink {
+            pool,
+            observer: "test-observer".into(),
+            network: "mainnet".into(),
+        };
+        let message = fixture();
+        let evidence = decode(&message, 1000, Some("session-one".into())).unwrap();
+        let mut journal = Journal::open(&path, "mainnet", MAX_JOURNAL_BYTES).unwrap();
+        journal.store(evidence.clone(), &message.data).unwrap();
+        // A failed delivery retains the durable buffer (simulated database write rejection).
+        sqlx::query("ALTER TABLE captured_blocks ADD CONSTRAINT simulate_unavailable CHECK (false) NOT VALID")
+            .execute(&sink.pool)
+            .await
+            .unwrap();
+        assert!(sink.flush(&mut journal).await.is_err());
+        assert_eq!(journal.records.len(), 1);
+        drop(journal);
+        let mut journal = Journal::open(&path, "mainnet", MAX_JOURNAL_BYTES).unwrap();
+        sqlx::query("ALTER TABLE captured_blocks DROP CONSTRAINT simulate_unavailable")
+            .execute(&sink.pool)
+            .await
+            .unwrap();
+        sink.flush(&mut journal).await.unwrap();
+        assert!(journal.records.is_empty());
+        assert_eq!(journal.bytes, 0);
+        // Replay after acknowledgement/receipt-session change does not duplicate or overwrite first receipt.
+        let mut replay = evidence.clone();
+        replay.received_at_ms = 9000;
+        replay.receipt_session = Some("session-two".into());
+        journal.store(replay, &message.data).unwrap();
+        sink.flush(&mut journal).await.unwrap();
+        let count: i64 = sqlx::query_scalar("SELECT count(*) FROM captured_blocks")
+            .fetch_one(&sink.pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 1);
+        let receipt: String =
+            sqlx::query_scalar("SELECT receipt_session FROM block_capture_receipts")
+                .fetch_one(&sink.pool)
+                .await
+                .unwrap();
+        assert_eq!(receipt, "session-one");
+        let mut competing = message.clone();
+        competing.data[108] ^= 1;
+        competing.hash = hex::decode(
+            Block::zcash_deserialize(&mut std::io::Cursor::new(&competing.data))
+                .unwrap()
+                .hash()
+                .to_string(),
+        )
+        .unwrap();
+        let competing_evidence = decode(&competing, 2000, None).unwrap();
+        journal
+            .store(competing_evidence.clone(), &competing.data)
+            .unwrap();
+        sink.flush(&mut journal).await.unwrap();
+        // Losing blocks keep bodies; only an old canonical match can release its redundant body.
+        sqlx::query("INSERT INTO blocks VALUES ($1,$2),($3,'later-tip')")
+            .bind(evidence.height as i64)
+            .bind(&evidence.hash)
+            .bind(evidence.height as i64 + 501)
+            .execute(&sink.pool)
+            .await
+            .unwrap();
+        sink.flush(&mut journal).await.unwrap();
+        let pruned: bool = sqlx::query_scalar(
+            "SELECT raw_pruned AND raw_block IS NULL FROM captured_blocks WHERE hash=$1",
+        )
+        .bind(&evidence.hash)
+        .fetch_one(&sink.pool)
+        .await
+        .unwrap();
+        assert!(pruned);
+        let retained: bool = sqlx::query_scalar(
+            "SELECT raw_block IS NOT NULL AND NOT raw_pruned FROM captured_blocks WHERE hash=$1",
+        )
+        .bind(&competing_evidence.hash)
+        .fetch_one(&sink.pool)
+        .await
+        .unwrap();
+        assert!(
+            retained,
+            "competing block bodies must never be pruned as canonical"
+        );
+        // Metadata survives body retention, preserving future status/rate comparisons.
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM captured_blocks")
+                .fetch_one(&sink.pool)
+                .await
+                .unwrap(),
+            2
+        );
+        sink.pool.close().await;
+        std::fs::remove_dir_all(path).unwrap();
+    }
 
     fn fixture() -> super::super::grpc::proto::BlockAndHash {
         let rows: serde_json::Value =
@@ -607,9 +940,11 @@ mod tests {
         }
     }
     fn directory() -> PathBuf {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         std::env::temp_dir().join(format!(
-            "capture-test-{}-{}",
+            "capture-test-{}-{}-{}",
             std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()

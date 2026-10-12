@@ -1,11 +1,51 @@
-# Experimental orphan-evidence capture
+# Competing-block capture
 
-This is a filesystem-only trial of `NonFinalizedStateChange` capture. It does
-not access PostgreSQL, insert orphan rows, or change the displayed orphan rate.
-It is disabled in normal live indexing unless both `ENABLE_ORPHAN_CAPTURE=true`
-and `ORPHAN_CAPTURE_PATH` are explicitly configured. Do not enable it for
-unattended production collection yet: retention/export and real competing-fork
-recovery remain release gates.
+`orphan-collect` is the continuous database-backed mode. `orphan-shadow` remains
+an isolated filesystem-only diagnostic and does not change public rates.
+
+Apply migration **035_live_block_capture.sql** before starting the collector.
+Run it as the separate `deploy/cipherscan-orphan-collector.service`, with an
+independently installed tested binary and a protected environment file containing
+DATABASE_URL, NETWORK, ZEBRA_RPC_URL, ZEBRA_GRPC_URL and the node's RPC credentials.
+Use a dedicated DB login with SELECT on blocks and SELECT/INSERT/UPDATE only on
+captured_blocks, block_capture_observers and block_capture_receipts. It must not
+write blocks, transactions, balances, sync_state or the canonical indexer archive.
+The DB's genesis must match the configured node network. Standby writers stay off.
+
+Continuous mode fsyncs each block to a bounded local buffer, commits blocks and
+per-observer receipts in one PostgreSQL transaction, then removes acknowledged
+files. Hash primary keys make crash replay and duplicate delivery safe. Database
+failure retains files; reconnect/heartbeat delivery retries. If the outage fills
+the buffer, collection fails visibly and systemd retries after ten seconds.
+No unacknowledged evidence is deleted to make room. Limits protect disk during
+outages; successful delivery makes room continuously. The UI reports stale
+collector heartbeats as unavailable and retains previously stored observations.
+A collector with backlog is not reported healthy.
+
+Raw bodies of matching canonical blocks more than 500 heights behind the indexed
+tip are cleared in batches of 64. Metadata and per-observer receipts remain.
+Competing bodies remain stored. This avoids indefinitely duplicating the entire
+canonical blockchain. Resume heads older than 500 heights behind the serving
+node are retired on reconnect; outages/restarts remain explicitly unverified.
+
+Public method **observed-block-capture-v2** unions indexer reorg archives with
+captured competitors, deduplicates by full hash and compares against the current
+indexed chain in one SQL snapshot. Captures ahead of indexed heights do not count.
+Restored canonical hashes immediately stop counting. Archive attribution wins
+when both sources contain a hash. Invalid/external-only reports stay excluded.
+Header-time windows and fraction units are unchanged. Historical coverage remains
+unverified; capture.startedAt describes only this new collection source, not
+historical completeness or the node's peer-arrival time. Existing orphan detail
+pages still describe the canonical indexer's archive; captured evidence is stored
+separately and does not manufacture archived transactions or fork events.
+
+Rollout: migrate, install/start the separate collector, verify fresh DB receipts
+and bounded disk use, deploy frontend support for both method versions, then
+activate the API's new source. Rollback stops the collector and restores the prior
+API module; retain additive tables and buffered evidence. Check actual service
+PID/artifact, canonical indexer health and standby inactivity independently.
+
+Shadow trials:
 
 Run against matching mainnet RPC and gRPC endpoints, using the usual RPC cookie
 configuration, with a dedicated journal directory:
@@ -61,7 +101,7 @@ hashes. Remaining/failed checks are unresolved. `non_canonical_at_check` is a
 reversible point-in-time branch status, not a permanent orphan classification.
 Neither this status nor advertised hashes enter rate calculations.
 
-Before enabling an API/rate source: implement bounded retention/export, verify
+Additional coverage validation should verify
 contextually valid competing forks and restored branches on an isolated node,
 exercise slow-consumer/restart/node-session transitions, measure on-server
 memory/latency/IO under representative load, and coordinate a reviewed schema,
