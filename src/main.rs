@@ -85,6 +85,14 @@ enum Commands {
         reconnect_after: Option<u64>,
     },
 
+    /// Continuously capture node-validated blocks into PostgreSQL, independently of indexing
+    OrphanCollect {
+        #[arg(long)]
+        journal: std::path::PathBuf,
+        #[arg(long)]
+        observer: String,
+    },
+
     /// Show indexer status
     Status {
         /// Emit machine-readable JSON
@@ -365,6 +373,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 )
                 .into());
             }
+        }
+        Commands::OrphanCollect { journal, observer } => {
+            let url = config
+                .zebra_grpc_url
+                .as_deref()
+                .ok_or("ZEBRA_GRPC_URL required")?;
+            db::orphan_capture::run_live_capture(
+                url,
+                &journal,
+                config.network_name(),
+                &config.database_url,
+                &observer,
+            )
+            .await?;
         }
         Commands::Status { json } => {
             commands::status::show_status(&config, json).await?;

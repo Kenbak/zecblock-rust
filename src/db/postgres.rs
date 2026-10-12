@@ -10,7 +10,7 @@ use std::time::Instant;
 
 // ZIP-214 FPF/ZCG recipients are funding streams, not miner identities.
 // Exclude both networks; shielded miner recipients remain unknown.
-fn miner_address_candidate(address: Option<&str>) -> Option<String> {
+pub(crate) fn miner_address_candidate(address: Option<&str>) -> Option<String> {
     address
         .filter(|address| {
             !matches!(

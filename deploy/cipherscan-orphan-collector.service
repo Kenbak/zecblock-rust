@@ -1,0 +1,36 @@
+[Unit]
+Description=ZecBlock continuous competing-block collector
+After=network-online.target postgresql.service
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+WorkingDirectory=/var/lib/cipherscan-orphan-collector
+EnvironmentFile=/etc/cipherscan/orphan-collector.env
+Environment=TOKIO_WORKER_THREADS=2
+ExecStart=/opt/cipherscan-orphan-collector/cipherscan-indexer orphan-collect --journal /var/lib/cipherscan-orphan-collector --observer local-node
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=15
+StateDirectory=cipherscan-orphan-collector
+StateDirectoryMode=0700
+UMask=0077
+MemoryMax=256M
+MemorySwapMax=0
+CPUQuota=25%
+IOWeight=10
+Nice=10
+TasksMax=32
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target
