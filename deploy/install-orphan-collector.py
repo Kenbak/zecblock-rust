@@ -19,7 +19,14 @@ for line in pathlib.Path('/root/cipherscan-rust/.env').read_text().splitlines():
 allowed=('ZEBRA_RPC_URL','ZEBRA_GRPC_URL','ZEBRA_RPC_COOKIE_FILE','ZEBRA_RPC_USER','ZEBRA_RPC_PASS')
 env={k:source[k] for k in allowed if k in source}
 assert env.get('ZEBRA_RPC_URL') and env.get('ZEBRA_GRPC_URL'), 'node endpoints missing'
-assert env.get('ZEBRA_RPC_COOKIE_FILE') or (env.get('ZEBRA_RPC_USER') and env.get('ZEBRA_RPC_PASS')), 'node auth missing'
+if not (env.get('ZEBRA_RPC_COOKIE_FILE') or (env.get('ZEBRA_RPC_USER') and env.get('ZEBRA_RPC_PASS'))):
+    # Some serving nodes deliberately expose unauthenticated RPC on loopback.
+    # Match that existing configuration, but never allow an unauthenticated remote endpoint.
+    from urllib.parse import urlparse
+    import ipaddress
+    endpoint = urlparse(env['ZEBRA_RPC_URL'])
+    assert endpoint.scheme in ('http', 'https') and endpoint.hostname, 'invalid RPC endpoint'
+    assert endpoint.hostname == 'localhost' or ipaddress.ip_address(endpoint.hostname).is_loopback, 'remote node auth missing'
 pw=secrets.token_hex(32)
 sql=f"""DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='zecblock_capture') THEN CREATE ROLE zecblock_capture LOGIN; END IF; END $$;
 ALTER ROLE zecblock_capture WITH PASSWORD '{pw}' NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION CONNECTION LIMIT 2;
