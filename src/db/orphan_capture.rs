@@ -263,6 +263,7 @@ impl Journal {
         for evidence in recovered {
             journal.advance_head(&evidence);
         }
+        journal.compact_resume_heads();
         journal.gap("startup: historical and interrupted collection coverage unverified")?;
         Ok(journal)
     }
@@ -301,7 +302,23 @@ impl Journal {
         self.health
             .head_heights
             .retain(|hash, _| self.health.heads.contains(hash));
-        // Refuse excess heads at subscription time; never silently discard a fork.
+        self.compact_resume_heads();
+    }
+
+    fn compact_resume_heads(&mut self) {
+        // These hashes are replay-suppression hints, not retained block evidence.
+        // The node can retain fewer forks than we have observed over time. Omitting
+        // an old hint makes it replay more retained blocks on reconnect; database
+        // and journal hash keys deduplicate them. Never stop capture for this.
+        let excess = self
+            .health
+            .heads
+            .len()
+            .saturating_sub(zakura_chain::parameters::MAX_NON_FINALIZED_CHAIN_FORKS);
+        self.health.heads.drain(..excess);
+        self.health
+            .head_heights
+            .retain(|hash, _| self.health.heads.contains(hash));
     }
 
     fn store(&mut self, evidence: Evidence, raw: &[u8]) -> Result<bool, String> {
@@ -329,10 +346,6 @@ impl Journal {
         self.bytes += size;
         self.advance_head(&evidence);
         self.records.insert(evidence.hash.clone(), evidence);
-        if self.health.heads.len() > zakura_chain::parameters::MAX_NON_FINALIZED_CHAIN_FORKS {
-            self.gap("capture resume heads exceed node fork limit")?;
-            return Err("capture resume heads exceed node fork limit".into());
-        }
         self.save_health()?;
         Ok(true)
     }
@@ -445,22 +458,9 @@ async fn run_capture_inner(
                 );
             }
             drop(check);
-            if sink.is_some() {
-                // Only retire heads far behind the serving node, never recent forks.
-                // A reconnect after this horizon remains explicitly incomplete.
-                let floor = tip.height.saturating_sub(500);
-                let stale: Vec<_> = journal
-                    .health
-                    .head_heights
-                    .iter()
-                    .filter(|(_, height)| **height < floor)
-                    .map(|(hash, _)| hash.clone())
-                    .collect();
-                for hash in stale {
-                    journal.health.heads.retain(|head| head != &hash);
-                    journal.health.head_heights.remove(&hash);
-                }
-            }
+            // Keep even old resume hints: unrecognized hashes cause retained
+            // history to replay. Clearing them and taking a fresh baseline here
+            // would instead skip blocks the node can still recover after an outage.
             if journal.health.heads.is_empty() {
                 // Explicit initial baseline, not an assertion of past capture.
                 let mut tips = rpc.get_fork_tip_hashes().await?;
@@ -977,6 +977,67 @@ mod tests {
         assert!(resumed.health.heads.contains(&evidence.hash));
         drop(resumed);
         assert!(Journal::open(&path, "testnet", MAX_JOURNAL_BYTES).is_err());
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn historical_fork_hints_do_not_stop_durable_capture() {
+        let path = directory();
+        let message = fixture();
+        let evidence = decode(&message, 123, None).unwrap();
+        let limit = zakura_chain::parameters::MAX_NON_FINALIZED_CHAIN_FORKS;
+        let mut journal = Journal::open(&path, "mainnet", MAX_JOURNAL_BYTES).unwrap();
+        journal.health.heads = (0..limit).map(|i| hex::encode([i as u8; 32])).collect();
+        let oldest = journal.health.heads[0].clone();
+        assert!(journal.store(evidence.clone(), &message.data).unwrap());
+        assert_eq!(journal.health.heads.len(), limit);
+        assert!(!journal.health.heads.contains(&oldest));
+        assert!(journal.health.heads.contains(&evidence.hash));
+        assert_eq!(journal.records.len(), 1);
+        drop(journal);
+        let resumed = Journal::open(&path, "mainnet", MAX_JOURNAL_BYTES).unwrap();
+        assert_eq!(resumed.records[&evidence.hash].received_at_ms, 123);
+        assert_eq!(resumed.health.heads.len(), limit);
+        drop(resumed);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn restart_repairs_oversized_legacy_checkpoint_without_deleting_evidence() {
+        let path = directory();
+        let message = fixture();
+        let evidence = decode(&message, 123, None).unwrap();
+        let limit = zakura_chain::parameters::MAX_NON_FINALIZED_CHAIN_FORKS;
+        let mut journal = Journal::open(&path, "mainnet", MAX_JOURNAL_BYTES).unwrap();
+        journal.store(evidence.clone(), &message.data).unwrap();
+        journal.health.heads = (0..limit + 1).map(|i| hex::encode([i as u8; 32])).collect();
+        journal.save_health().unwrap();
+        drop(journal);
+        let resumed = Journal::open(&path, "mainnet", MAX_JOURNAL_BYTES).unwrap();
+        assert_eq!(resumed.health.heads.len(), limit);
+        assert!(resumed.health.heads.contains(&evidence.hash));
+        assert_eq!(resumed.records.len(), 1);
+        assert!(path.join(format!("{}.capture", evidence.hash)).exists());
+        drop(resumed);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn oversized_acknowledged_checkpoint_resumes_without_a_fresh_baseline() {
+        let path = directory();
+        let limit = zakura_chain::parameters::MAX_NON_FINALIZED_CHAIN_FORKS;
+        let mut journal = Journal::open(&path, "mainnet", MAX_JOURNAL_BYTES).unwrap();
+        journal.health.heads = (0..limit + 1).map(|i| hex::encode([i as u8; 32])).collect();
+        let latest = journal.health.heads.last().unwrap().clone();
+        let started = journal.health.started_at_ms;
+        journal.save_health().unwrap();
+        drop(journal);
+        let resumed = Journal::open(&path, "mainnet", MAX_JOURNAL_BYTES).unwrap();
+        assert_eq!(resumed.health.heads.len(), limit);
+        assert!(resumed.health.heads.contains(&latest));
+        assert_eq!(resumed.health.started_at_ms, started);
+        assert!(resumed.records.is_empty());
+        drop(resumed);
         std::fs::remove_dir_all(path).unwrap();
     }
 

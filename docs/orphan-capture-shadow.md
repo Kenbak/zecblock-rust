@@ -25,8 +25,12 @@ A collector with backlog is not reported healthy.
 Raw bodies of matching canonical blocks more than 500 heights behind the indexed
 tip are cleared in batches of 64. Metadata and per-observer receipts remain.
 Competing bodies remain stored. This avoids indefinitely duplicating the entire
-canonical blockchain. Resume heads older than 500 heights behind the serving
-node are retired on reconnect; outages/restarts remain explicitly unverified.
+canonical blockchain. Resume markers keep the most recently observed tips within
+the node request limit. They only suppress replay: forgetting an older marker
+allows more retained blocks to replay, without deleting journal or database
+evidence. Old markers remain usable across long outages instead of taking a fresh
+baseline that could skip recoverable history. Oversized legacy checkpoints are
+compacted automatically on startup. Outages/restarts remain explicitly unverified.
 
 Public method **observed-block-capture-v2** unions indexer reorg archives with
 captured competitors, deduplicates by full hash and compares against the current
