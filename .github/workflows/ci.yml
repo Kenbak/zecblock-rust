@@ -71,6 +71,11 @@ jobs:
           printf '%s\n' "$output"
           grep -q 'All migrations already applied' <<< "$output"
 
+      - name: Reproduce and verify subsidy cache default-ACL repair
+        env:
+          MIGRATION_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/cipherscan_ci
+        run: python3 -m unittest discover -s deploy -p 'test_subsidy_allocation_privileges.py' -v
+
       - name: cargo build --locked --release
         run: cargo build --locked --release
 
