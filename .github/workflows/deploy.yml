@@ -40,7 +40,7 @@ jobs:
         run: python3 deploy/verify-deployment.py
 
       - name: Download the exact binary tested by CI
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v8
         with:
           name: cipherscan-indexer-linux-x86_64-${{ github.event.workflow_run.head_sha }}
           path: artifact
