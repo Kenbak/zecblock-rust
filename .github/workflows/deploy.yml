@@ -30,7 +30,7 @@ jobs:
       github.event.workflow_run.head_repository.full_name == github.repository
     steps:
       - name: Checkout trusted release verifier
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           ref: main
           fetch-depth: 0
