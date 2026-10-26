@@ -1,10 +1,16 @@
 name: Deploy
 
 on:
-  workflow_run:
-    workflows: [CI]
-    types: [completed]
-    branches: [main]
+  workflow_dispatch:
+    inputs:
+      target_sha:
+        description: Full current-main commit approved for native production release
+        required: true
+        type: string
+      ci_run_id:
+        description: Latest successful push CI run for that exact commit
+        required: true
+        type: string
 
 concurrency:
   group: deploy-main
@@ -23,11 +29,9 @@ jobs:
     name: Deploy to servers
     runs-on: ubuntu-latest
     environment: production
-    if: >-
-      github.event.workflow_run.conclusion == 'success' &&
-      github.event.workflow_run.event == 'push' &&
-      github.event.workflow_run.head_branch == 'main' &&
-      github.event.workflow_run.head_repository.full_name == github.repository
+    env:
+      RELEASE_ID: ${{ github.run_id }}-${{ github.run_attempt }}
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
     steps:
       - name: Checkout trusted release verifier
         uses: actions/checkout@v4
@@ -37,15 +41,18 @@ jobs:
           persist-credentials: false
 
       - name: Verify trusted release and select the exact tested commit
+        id: release
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         run: python3 deploy/verify-deployment.py
 
       - name: Download the exact binary tested by CI
         uses: actions/download-artifact@v5
         with:
-          name: cipherscan-indexer-linux-x86_64-${{ github.event.workflow_run.head_sha }}
+          name: cipherscan-indexer-linux-x86_64-${{ steps.release.outputs.target_sha }}-attempt-${{ steps.release.outputs.ci_run_attempt }}
           path: artifact
           github-token: ${{ secrets.GITHUB_TOKEN }}
-          run-id: ${{ github.event.workflow_run.id }}
+          run-id: ${{ steps.release.outputs.ci_run_id }}
 
       - name: Validate deployment artifact
         run: |
@@ -53,6 +60,12 @@ jobs:
           chmod 0755 artifact/cipherscan-indexer
           file artifact/cipherscan-indexer | tee /tmp/cipherscan-artifact-type
           grep -Eq 'ELF 64-bit.*x86-64' /tmp/cipherscan-artifact-type
+
+      - name: Revalidate release checks before server access
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          EXPECTED_RELEASE: ${{ steps.release.outputs.release }}
+        run: python3 deploy/verify-deployment.py
 
       - name: Set up SSH
         run: |
@@ -88,85 +101,187 @@ jobs:
           echo "SSH config written:"
           cat ~/.ssh/config
 
-      - name: Stage tested binary on both servers
+      - name: Write release transaction helper
         run: |
-          scp artifact/cipherscan-indexer primary:/tmp/cipherscan-indexer-candidate
-          scp artifact/cipherscan-indexer standby:/tmp/cipherscan-indexer-candidate
+          cat > /tmp/cipherscan-release-transaction.sh << 'SCRIPT'
+          # BEGIN RELEASE TRANSACTION
+          set -euo pipefail
+          action=$1 release_id=$2 target_sha=$3 role=$4
+          [[ "$release_id" =~ ^[0-9]+-[0-9]+$ ]]
+          [[ "$target_sha" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$role" == primary || "$role" == standby ]]
+          # SSH cancellation need not stop its remote child. Serialize complete
+          # transactions so rollback cannot finish before an in-flight mutation.
+          # This lock is separate from the live writer's ingestion fence.
+          exec 9>/run/cipherscan-release-transaction.lock
+          flock -x -w 120 9
+          root=/root/cipherscan-rust
+          unit=/etc/systemd/system/cipherscan-rust.service
+          candidate=/tmp/cipherscan-indexer-$release_id
+          state=$root/.deploy-releases/$release_id
+          binary=$root/target/release/cipherscan-indexer
 
-      - name: Detect roles (which box is PG primary)
-        id: roles
-        run: |
-          echo "Testing SSH connectivity..."
-          ssh primary "echo 'primary OK'" || { echo "::error::SSH to primary failed"; exit 1; }
-          ssh standby "echo 'standby OK'" || { echo "::error::SSH to standby failed"; exit 1; }
-          primary_is_recovery=$(ssh primary "sudo -u postgres psql -qtAX -c 'SELECT pg_is_in_recovery();'")
-          echo "primary pg_is_in_recovery=$primary_is_recovery"
-          if [[ "$primary_is_recovery" == "f" ]]; then
-            echo "pg_primary=primary" >> "$GITHUB_OUTPUT"
-            echo "PG primary is on: primary (${{ secrets.PRIMARY_HOST }})"
-          else
-            standby_is_recovery=$(ssh standby "sudo -u postgres psql -qtAX -c 'SELECT pg_is_in_recovery();'")
-            echo "standby pg_is_in_recovery=$standby_is_recovery"
-            if [[ "$standby_is_recovery" == "f" ]]; then
-              echo "pg_primary=standby" >> "$GITHUB_OUTPUT"
-              echo "PG primary is on: standby (${{ secrets.STANDBY_HOST }})"
+          check_role() {
+            active_status=0 enabled_status=0
+            recovery=$(sudo -u postgres psql -qtAX -v ON_ERROR_STOP=1 -c 'SELECT pg_is_in_recovery();')
+            if [ "$role" = primary ]; then
+              test "$recovery" = f
             else
-              echo "::error::Cannot determine PG primary role"
-              exit 1
+              test "$recovery" = t
+              active=$(systemctl is-active cipherscan-rust.service) || active_status=$?
+              test "$active" = inactive
+              test "${active_status:-0}" = 3
+              enabled=$(systemctl is-enabled cipherscan-rust.service) || enabled_status=$?
+              test "$enabled" = disabled
+              test "${enabled_status:-0}" = 1
             fi
-          fi
+          }
+
+          # Restores use a sibling file + rename: never truncate a running ELF.
+          restore_file() {
+            cp -a "$1" "$2.rollback-$release_id"
+            mv -f "$2.rollback-$release_id" "$2"
+          }
+          replace_file() {
+            install -m "$3" "$1" "$2.candidate-$release_id"
+            # A failed/partial rename is recoverable only after a complete backup.
+            touch "$state/$4.changed"
+            mv -f "$2.candidate-$release_id" "$2"
+          }
+          cleanup_temporary() {
+            rm -f "$candidate" "$binary.candidate-$release_id" "$binary.rollback-$release_id" \
+              "$unit.candidate-$release_id" "$unit.rollback-$release_id"
+          }
+
+          case "$action" in
+            check)
+              check_role
+              if [ "$role" = primary ]; then
+                systemctl is-active --quiet cipherscan-rust.service
+              fi
+              ;;
+            prepare)
+              check_role
+              cd "$root"
+              git diff --quiet
+              git diff --cached --quiet
+              git fetch origin main
+              test "$(git rev-parse origin/main)" = "$target_sha"
+              test -f "$candidate"
+              test -x "$binary"
+              test -f "$unit"
+              umask 077
+              mkdir -p "$root/.deploy-releases"
+              # Never reuse backups or mutation markers from another attempt.
+              mkdir "$state"
+              git rev-parse HEAD > "$state/source.previous"
+              grep -Eq '^[0-9a-f]{40}$' "$state/source.previous"
+              cp -a "$binary" "$state/binary.previous"
+              cp -a "$unit" "$state/unit.previous"
+              # All backups are complete before the first source/file mutation.
+              touch "$state/source.changed"
+              git reset --hard "$target_sha"
+              replace_file "$candidate" "$binary" 0755 binary
+              if [ "$role" = standby ]; then
+                replace_file deploy/cipherscan-rust.service "$unit" 0644 unit
+                systemctl daemon-reload
+              fi
+              touch "$state/prepared"
+              rm -f "$candidate"
+              ;;
+            activate)
+              test "$role" = primary
+              test -f "$state/prepared"
+              check_role
+              cd "$root"
+              replace_file deploy/cipherscan-rust.service "$unit" 0644 unit
+              systemctl daemon-reload
+              # Even a failing restart can stop the old writer and needs recovery.
+              touch "$state/restart.attempted"
+              systemctl restart cipherscan-rust.service
+              sleep 5
+              set -a
+              source .env
+              set +a
+              systemctl is-active --quiet cipherscan-rust.service
+              "$binary" health --json > "$state/health.json"
+              ;;
+            rollback)
+              if [ -d "$state" ] && [ ! -f "$state/rollback.done" ]; then
+                # Untouched hosts never consume any persistent .previous files.
+                if [ -f "$state/source.changed" ] || [ -f "$state/binary.changed" ] \
+                   || [ -f "$state/unit.changed" ]; then
+                  check_role
+                  if [ -f "$state/binary.changed" ]; then
+                    restore_file "$state/binary.previous" "$binary"
+                  fi
+                  if [ -f "$state/unit.changed" ]; then
+                    restore_file "$state/unit.previous" "$unit"
+                    systemctl daemon-reload
+                  fi
+                  if [ -f "$state/source.changed" ]; then
+                    previous=$(cat "$state/source.previous")
+                    [[ "$previous" =~ ^[0-9a-f]{40}$ ]]
+                    git -C "$root" reset --hard "$previous"
+                  fi
+                  if [ -f "$state/restart.attempted" ]; then
+                    test "$role" = primary
+                    systemctl restart cipherscan-rust.service
+                    systemctl is-active --quiet cipherscan-rust.service
+                  fi
+                fi
+                touch "$state/rollback.done"
+              fi
+              cleanup_temporary
+              ;;
+            *) echo 'Unknown release transaction action' >&2; exit 1 ;;
+          esac
+          # END RELEASE TRANSACTION
+          SCRIPT
+          bash -n /tmp/cipherscan-release-transaction.sh
+
+      - name: Require expected database and passive standby roles before staging
+        run: |
+          for host in primary standby; do
+            ssh "$host" "bash -s -- check '$RELEASE_ID' '${{ steps.release.outputs.target_sha }}' '$host'" \
+              < /tmp/cipherscan-release-transaction.sh
+          done
+
+      - name: Stage tested binary on both servers
+        id: stage
+        run: |
+          scp artifact/cipherscan-indexer "primary:/tmp/cipherscan-indexer-$RELEASE_ID"
+          scp artifact/cipherscan-indexer "standby:/tmp/cipherscan-indexer-$RELEASE_ID"
 
       - name: Prepare candidate on primary box
+        run: |
+          ssh primary "bash -s -- prepare '$RELEASE_ID' '${{ steps.release.outputs.target_sha }}' primary" \
+            < /tmp/cipherscan-release-transaction.sh
+
+      - name: Prepare candidate on standby box
+        run: |
+          ssh standby "bash -s -- prepare '$RELEASE_ID' '${{ steps.release.outputs.target_sha }}' standby" \
+            < /tmp/cipherscan-release-transaction.sh
+
+      - name: Revalidate release checks after staging before migrations and activation
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          EXPECTED_RELEASE: ${{ steps.release.outputs.release }}
+        run: python3 deploy/verify-deployment.py
+
+      - name: Recheck expected roles before migrations and activation
+        run: |
+          for host in primary standby; do
+            ssh "$host" "bash -s -- check '$RELEASE_ID' '${{ steps.release.outputs.target_sha }}' '$host'" \
+              < /tmp/cipherscan-release-transaction.sh
+          done
+
+      - name: Apply additive migrations on expected PG primary
         run: |
           ssh primary << 'REMOTE'
           set -euo pipefail
           cd /root/cipherscan-rust
-          git fetch origin main
-          git merge-base --is-ancestor "${{ github.event.workflow_run.head_sha }}" origin/main
-          git reset --hard "${{ github.event.workflow_run.head_sha }}"
-
-          install -d -m 0755 target/release
-          if [ -x target/release/cipherscan-indexer ]; then
-            cp -a target/release/cipherscan-indexer target/release/cipherscan-indexer.previous
-          fi
-          install -m 0755 /tmp/cipherscan-indexer-candidate target/release/cipherscan-indexer
-          rm -f /tmp/cipherscan-indexer-candidate
-
-          if [ -f /etc/systemd/system/cipherscan-rust.service ]; then
-            cp -a /etc/systemd/system/cipherscan-rust.service /etc/systemd/system/cipherscan-rust.service.previous
-          fi
-          echo "Primary candidate prepared; current service is still running"
-          REMOTE
-
-      - name: Prepare candidate on standby box
-        run: |
-          ssh standby << 'REMOTE'
-          set -euo pipefail
-          cd /root/cipherscan-rust
-          git fetch origin main
-          git merge-base --is-ancestor "${{ github.event.workflow_run.head_sha }}" origin/main
-          git reset --hard "${{ github.event.workflow_run.head_sha }}"
-
-          install -d -m 0755 target/release
-          if [ -x target/release/cipherscan-indexer ]; then
-            cp -a target/release/cipherscan-indexer target/release/cipherscan-indexer.previous
-          fi
-
-          install -m 0755 /tmp/cipherscan-indexer-candidate target/release/cipherscan-indexer
-          rm -f /tmp/cipherscan-indexer-candidate
-
-          install -m 0644 deploy/cipherscan-rust.service /etc/systemd/system/cipherscan-rust.service
-          systemctl daemon-reload
-
-          echo "Standby candidate prepared"
-          REMOTE
-
-      - name: Apply additive migrations on PG primary
-        run: |
-          PG_HOST="${{ steps.roles.outputs.pg_primary }}"
-          ssh "$PG_HOST" << 'REMOTE'
-          set -euo pipefail
-          cd /root/cipherscan-rust
+          test "$(sudo -u postgres psql -qtAX -v ON_ERROR_STOP=1 -c 'SELECT pg_is_in_recovery();')" = f
           set -a
           source .env
           set +a
@@ -185,60 +300,28 @@ jobs:
       - name: Activate candidate on primary box
         id: activate
         run: |
-          ssh primary << 'REMOTE'
-          set -euo pipefail
-          cd /root/cipherscan-rust
-
-          echo "Installing versioned systemd unit..."
-          install -m 0644 deploy/cipherscan-rust.service /etc/systemd/system/cipherscan-rust.service
-          systemctl daemon-reload
-
-          echo "Restarting indexer after successful schema expansion..."
-          candidate_ok=false
-          if systemctl restart cipherscan-rust.service; then
-            sleep 5
-            set -a
-            source .env
-            set +a
-            if systemctl is-active --quiet cipherscan-rust.service \
-               && target/release/cipherscan-indexer health --json >/tmp/cipherscan-indexer-health.json; then
-              candidate_ok=true
-            fi
-          fi
-          if [ "$candidate_ok" != "true" ]; then
-            echo "Candidate failed health startup; restoring previous binary"
-            if [ -x target/release/cipherscan-indexer.previous ]; then
-              cp -a target/release/cipherscan-indexer.previous target/release/cipherscan-indexer
-            fi
-            if [ -f /etc/systemd/system/cipherscan-rust.service.previous ]; then
-              cp -a /etc/systemd/system/cipherscan-rust.service.previous /etc/systemd/system/cipherscan-rust.service
-              systemctl daemon-reload
-            fi
-            systemctl restart cipherscan-rust.service || true
-            systemctl status cipherscan-rust.service --no-pager || true
-            exit 1
-          fi
-
-          echo "Primary deploy complete"
-          REMOTE
-
-      - name: Restore staged binaries if deployment failed before activation
-        if: failure() && steps.activate.outcome != 'success'
-        run: |
-          for host in primary standby; do
-            ssh "$host" '
-              if [ -x /root/cipherscan-rust/target/release/cipherscan-indexer.previous ]; then
-                cp -a /root/cipherscan-rust/target/release/cipherscan-indexer.previous /root/cipherscan-rust/target/release/cipherscan-indexer
-              fi
-              rm -f /tmp/cipherscan-indexer-candidate
-            ' || true
-          done
+          ssh primary "bash -s -- activate '$RELEASE_ID' '${{ steps.release.outputs.target_sha }}' primary" \
+            < /tmp/cipherscan-release-transaction.sh
 
       - name: Verify
         run: |
           echo "=== Primary indexer status ==="
           ssh primary "systemctl is-active cipherscan-rust.service && journalctl -u cipherscan-rust -n 3 --no-pager"
-          echo ""
+          echo "=== Standby remains passive ==="
+          ssh standby "bash -s -- check '$RELEASE_ID' '${{ steps.release.outputs.target_sha }}' standby" \
+            < /tmp/cipherscan-release-transaction.sh
           echo "=== Replication status ==="
-          PG_HOST="${{ steps.roles.outputs.pg_primary }}"
-          ssh "$PG_HOST" "sudo -u postgres psql -c \"SELECT client_addr, state, sent_lsn, replay_lsn FROM pg_stat_replication;\"" || true
+          ssh primary "sudo -u postgres psql -c \"SELECT client_addr, state, sent_lsn, replay_lsn FROM pg_stat_replication;\"" || true
+
+      - name: Roll back only this release's host changes on failure
+        if: (failure() || cancelled()) && (steps.stage.outcome == 'success' || steps.stage.outcome == 'failure')
+        run: |
+          rollback_failed=0
+          for host in primary standby; do
+            if ! ssh "$host" "bash -s -- rollback '$RELEASE_ID' '${{ steps.release.outputs.target_sha }}' '$host'" \
+                < /tmp/cipherscan-release-transaction.sh; then
+              echo "::error::Rollback/temporary cleanup failed on $host; manual inspection required"
+              rollback_failed=1
+            fi
+          done
+          exit "$rollback_failed"
