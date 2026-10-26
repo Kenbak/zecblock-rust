@@ -18,7 +18,7 @@ jobs:
     # Match the Ubuntu 24.04 mainnet hosts; newer build images may require newer glibc.
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install protoc (required to build the gRPC .proto files)
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - uses: dtolnay/rust-toolchain@1.97.1
@@ -49,7 +49,7 @@ jobs:
           --health-timeout 5s
           --health-retries 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install protoc and postgresql-client
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler postgresql-client
       - uses: dtolnay/rust-toolchain@1.97.1
