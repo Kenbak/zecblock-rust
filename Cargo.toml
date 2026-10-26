@@ -8,7 +8,7 @@ license = "MIT"
 
 [dependencies]
 # Stay on the patched 1.51 line; RUSTSEC-2026-0386 also affects 1.52.
-tokio = { version = "~1.51.6", features = ["full"] }
+tokio = { version = "~1.54.1", features = ["full"] }
 
 # Database
 sqlx = { version = "0.8.6", default-features = false, features = ["runtime-tokio", "postgres", "chrono"] }
