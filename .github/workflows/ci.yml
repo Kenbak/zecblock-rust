@@ -21,7 +21,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install protoc (required to build the gRPC .proto files)
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
-      - uses: dtolnay/rust-toolchain@1.97.1
+      - uses: dtolnay/rust-toolchain@1.120.0
       - uses: Swatinem/rust-cache@v2
       - name: Test migration online-DDL checks
         run: python3 -m unittest discover -s deploy -p 'test_*.py'
@@ -52,7 +52,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install protoc and postgresql-client
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler postgresql-client
-      - uses: dtolnay/rust-toolchain@1.97.1
+      - uses: dtolnay/rust-toolchain@1.120.0
       - uses: Swatinem/rust-cache@v2
 
       - name: Apply schema to the disposable CI database
