@@ -85,7 +85,7 @@ jobs:
         run: cargo test --locked --release -- --test-threads=4
 
       - name: Publish the tested indexer binary
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: cipherscan-indexer-linux-x86_64-${{ github.sha }}-attempt-${{ github.run_attempt }}
           path: target/release/cipherscan-indexer
