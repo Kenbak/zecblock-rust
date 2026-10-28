@@ -59,6 +59,7 @@ INDEXER_MAX_LAG=3
 INDEXER_MAX_CONSECUTIVE_FAILURES=0
 INDEXER_MAX_HEARTBEAT_AGE_SECONDS=600
 INDEXER_ALERT_COOLDOWN_SECONDS=1800
+INDEXER_HEALTH_TIMEOUT_SECONDS=45
 ```
 
 ## Usage
@@ -283,7 +284,7 @@ How it works:
 5. repeated alerts are suppressed unless the failure fingerprint changes or the cooldown expires
 6. one recovery message is sent when the indexer becomes healthy again
 
-The monitoring path is optimized to avoid reopening RocksDB on each run. `health` now relies on PostgreSQL state plus Zebra RPC, enforces heartbeat freshness, and the steady-state cost is one lightweight health check every 5 minutes with zero outbound Telegram calls while healthy.
+The monitoring path is optimized to avoid reopening RocksDB on each run. `health` now relies on PostgreSQL state plus Zebra RPC, checks polling liveness separately from pending-work progress, and the steady-state cost is one lightweight health check every 5 minutes with zero outbound Telegram calls while healthy.
 
 ### Install The Timer
 
@@ -315,8 +316,9 @@ Recommended behavior for the first version:
 
 - `INDEXER_MAX_LAG=3` means alert if the live checkpoint falls more than 3 blocks behind the local Zebra tip
 - `INDEXER_MAX_CONSECUTIVE_FAILURES=0` means alert on the first persistent failure state
-- `INDEXER_MAX_HEARTBEAT_AGE_SECONDS=600` means alert if the live process stops updating its tip or success heartbeat for 10 minutes
-- `INDEXER_ALERT_COOLDOWN_SECONDS=1800` means resend at most every 30 minutes unless the failure changes
+- `INDEXER_MAX_HEARTBEAT_AGE_SECONDS=600` bounds successful tip polling and progress on pending work. A caught-up writer may wait indefinitely for a block while its tip polls remain fresh. `last_success_at` retains the actual last committed ingestion time. The durable `pending_work_since` clock starts when the writer observes outstanding blocks or a reorg check fails; repeated retries cannot reset it. Pending progress is measured from the later of that clock and the last successful ingestion, so a new block after a long idle period gets the full grace window. The pending clock clears only after a successful canonical-chain check confirms the writer is caught up. Missing or future clocks are unhealthy; a newly arrived RPC tip not yet observed by the writer receives bounded grace from its last successful tip poll.
+- `INDEXER_ALERT_COOLDOWN_SECONDS=1800` means resend at most every 30 minutes unless the failure category changes. JSON `reason_codes` provide stable categories; changing ages, heights, and metrics do not bypass the cooldown.
+- `INDEXER_HEALTH_TIMEOUT_SECONDS=45` bounds the health command; a stuck RPC or database read produces a timeout alert. The monitor requires GNU `timeout` and Python 3 (the standard server environment).
 - the systemd timer defaults to every 5 minutes to keep monitoring overhead low while still alerting fast enough for operator response
 
 ### Test It

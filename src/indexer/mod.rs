@@ -122,19 +122,15 @@ impl Indexer {
         Ok(())
     }
 
-    async fn record_tip_heartbeat(&self, rpc_tip: u32) -> Result<(), String> {
-        let now = unix_timestamp_secs().to_string();
-
+    async fn record_tip_heartbeat(
+        &self,
+        rpc_tip: u32,
+        pending_work: Option<bool>,
+    ) -> Result<(), String> {
         self.postgres
-            .update_checkpoint("last_seen_rpc_tip", &rpc_tip.to_string())
+            .update_live_tip(rpc_tip, pending_work)
             .await
-            .map_err(|e| format!("Heartbeat write error: {}", e))?;
-        self.postgres
-            .update_checkpoint("last_tip_check_at", &now)
-            .await
-            .map_err(|e| format!("Heartbeat write error: {}", e))?;
-
-        Ok(())
+            .map_err(|e| format!("Heartbeat write error: {}", e))
     }
 
     async fn record_success_heartbeat(&self) -> Result<(), String> {
@@ -930,14 +926,17 @@ impl Indexer {
                 }
             };
 
-            self.record_tip_heartbeat(rpc_tip).await?;
-
             let mut last_indexed = self
                 .postgres
                 .get_checkpoint()
                 .await
                 .map_err(|e| format!("Checkpoint error: {}", e))?
                 .unwrap_or(0);
+
+            // Publish successful polling immediately, but do not declare idle
+            // until the canonical-chain/reorg check also succeeds.
+            self.record_tip_heartbeat(rpc_tip, (rpc_tip > last_indexed).then_some(true))
+                .await?;
 
             // Check for reorgs before indexing new blocks
             let mut reorg_fork_height: Option<u32> = None;
@@ -957,6 +956,7 @@ impl Indexer {
                     Ok(None) => {} // no reorg
                     Err(e) => {
                         println!("   ⚠️ Reorg detection error: {}", e);
+                        self.record_tip_heartbeat(rpc_tip, Some(true)).await?;
                         tokio::time::sleep(Duration::from_secs(
                             self.config.live_poll_interval_secs,
                         ))
@@ -965,6 +965,9 @@ impl Indexer {
                     }
                 }
             }
+
+            self.record_tip_heartbeat(rpc_tip, Some(rpc_tip > last_indexed))
+                .await?;
 
             if rpc_tip > last_indexed {
                 let blocks_behind = rpc_tip - last_indexed;
