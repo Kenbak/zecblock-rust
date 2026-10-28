@@ -8,6 +8,8 @@ MAX_LAG="${INDEXER_MAX_LAG:-3}"
 MAX_CONSECUTIVE_FAILURES="${INDEXER_MAX_CONSECUTIVE_FAILURES:-0}"
 MAX_HEARTBEAT_AGE_SECONDS="${INDEXER_MAX_HEARTBEAT_AGE_SECONDS:-600}"
 ALERT_COOLDOWN_SECONDS="${INDEXER_ALERT_COOLDOWN_SECONDS:-1800}"
+HEALTH_TIMEOUT_SECONDS="${INDEXER_HEALTH_TIMEOUT_SECONDS:-45}"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 INDEXER_SERVICE_NAME="${INDEXER_SERVICE_NAME:-cipherscan-rust.service}"
 TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-}"
 TELEGRAM_CHAT_ID="${TELEGRAM_CHAT_ID:-}"
@@ -65,7 +67,7 @@ timestamp="$(date -u '+%Y-%m-%d %H:%M:%S UTC')"
 service_status="$(systemctl is-active "${INDEXER_SERVICE_NAME}" 2>&1 || true)"
 
 if [[ "${service_status}" == "active" ]]; then
-  health_output="$("${INDEXER_BIN}" health --max-lag "${MAX_LAG}" --max-consecutive-failures "${MAX_CONSECUTIVE_FAILURES}" --max-heartbeat-age "${MAX_HEARTBEAT_AGE_SECONDS}" --json 2>&1)" || health_rc=$?
+  health_output="$(timeout --kill-after=5s "${HEALTH_TIMEOUT_SECONDS}s" "${INDEXER_BIN}" health --max-lag "${MAX_LAG}" --max-consecutive-failures "${MAX_CONSECUTIVE_FAILURES}" --max-heartbeat-age "${MAX_HEARTBEAT_AGE_SECONDS}" --json 2>&1)" || health_rc=$?
   health_rc="${health_rc:-0}"
 else
   health_output="service ${INDEXER_SERVICE_NAME} is not active: ${service_status}"
@@ -73,7 +75,7 @@ else
 fi
 
 combined_output="$(printf 'service=%s\nhealth rc=%s\n%s\n' "${service_status}" "${health_rc}" "${health_output}")"
-fingerprint="$(printf '%s' "${combined_output}" | shasum -a 256 | awk '{print $1}')"
+fingerprint="$(printf '%s' "${health_output}" | python3 "${SCRIPT_DIR}/health-alert-fingerprint.py" "${service_status}" "${health_rc}")"
 summary="$(printf '%s' "${combined_output}" | tail -n 40 | cut -c1-3500)"
 
 if [[ "${health_rc}" -eq 0 ]]; then
@@ -86,7 +88,7 @@ if [[ "${health_rc}" -eq 0 ]]; then
 
 ✅ Service active
 ✅ Lag ≤ ${MAX_LAG} blocks
-✅ Heartbeat ≤ ${MAX_HEARTBEAT_AGE_SECONDS}s
+✅ Tip polling and pending-work progress within ${MAX_HEARTBEAT_AGE_SECONDS}s
 EOF
 )"
   fi
@@ -112,7 +114,7 @@ if (( should_alert == 1 )); then
 <b>Time:</b> ${timestamp}
 
 ❌ Service: ${service_status}
-<b>Thresholds:</b> lag ≤ ${MAX_LAG}, failures ≤ ${MAX_CONSECUTIVE_FAILURES}, heartbeat ≤ ${MAX_HEARTBEAT_AGE_SECONDS}s
+<b>Thresholds:</b> lag ≤ ${MAX_LAG}, failures ≤ ${MAX_CONSECUTIVE_FAILURES}, tip polling/pending progress ≤ ${MAX_HEARTBEAT_AGE_SECONDS}s
 
 <pre>${summary}</pre>
 EOF

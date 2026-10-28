@@ -38,6 +38,7 @@ pub(crate) struct IndexerStatus {
     last_seen_rpc_tip: Option<u32>,
     last_tip_check_at: Option<u64>,
     last_success_at: Option<u64>,
+    pending_work_since: Option<u64>,
     live_metrics: Option<LiveMetrics>,
     failure: FailureState,
 }
@@ -46,6 +47,7 @@ pub(crate) struct IndexerStatus {
 pub(crate) struct HealthAssessment {
     healthy: bool,
     reasons: Vec<String>,
+    reason_codes: Vec<&'static str>,
 }
 
 fn assess_health(
@@ -57,13 +59,16 @@ fn assess_health(
     now: u64,
 ) -> HealthAssessment {
     let mut reasons = Vec::new();
+    let mut reason_codes = Vec::new();
 
     if let Some(lag) = status.lag_blocks {
         if lag > max_lag {
             reasons.push(format!("lag {} exceeds threshold {}", lag, max_lag));
+            reason_codes.push("lag_exceeded");
         }
     } else {
         reasons.push("live checkpoint missing".to_string());
+        reason_codes.push("checkpoint_missing");
     }
 
     if let Some(last_indexed) = status.last_indexed_height {
@@ -72,6 +77,7 @@ fn assess_health(
                 "last indexed height {} exceeds chain tip {}",
                 last_indexed, status.chain_tip
             ));
+            reason_codes.push("checkpoint_ahead");
         }
     }
 
@@ -80,32 +86,75 @@ fn assess_health(
             "rpc tip unavailable; using {} fallback",
             status.chain_tip_source
         ));
+        reason_codes.push("rpc_unavailable");
     }
 
     match status.last_tip_check_at {
+        Some(0) | None => {
+            reasons.push("tip heartbeat missing".to_string());
+            reason_codes.push("tip_heartbeat_missing");
+        }
         Some(timestamp) => {
-            let age = now.saturating_sub(timestamp);
-            if age > max_heartbeat_age {
-                reasons.push(format!(
-                    "tip heartbeat age {}s exceeds threshold {}s",
-                    age, max_heartbeat_age
-                ));
+            if timestamp > now {
+                reasons.push("tip heartbeat is in the future".to_string());
+                reason_codes.push("tip_heartbeat_future");
+            } else {
+                let age = now - timestamp;
+                if age > max_heartbeat_age {
+                    reasons.push(format!(
+                        "tip heartbeat age {}s exceeds threshold {}s",
+                        age, max_heartbeat_age
+                    ));
+                    reason_codes.push("tip_heartbeat_stale");
+                }
             }
         }
-        None => reasons.push("tip heartbeat missing".to_string()),
     }
 
     match status.last_success_at {
+        Some(0) | None => {
+            reasons.push("success heartbeat missing".to_string());
+            reason_codes.push("success_heartbeat_missing");
+        }
         Some(timestamp) => {
-            let age = now.saturating_sub(timestamp);
-            if age > max_heartbeat_age {
-                reasons.push(format!(
-                    "success heartbeat age {}s exceeds threshold {}s",
-                    age, max_heartbeat_age
-                ));
+            if timestamp > now {
+                reasons.push("success heartbeat is in the future".to_string());
+                reason_codes.push("success_heartbeat_future");
+            } else if status.lag_blocks.is_some_and(|lag| lag > 0)
+                || status.pending_work_since.is_some()
+            {
+                // A new block after a long idle period gets a complete grace window.
+                // Before the writer observes that block, its last successful idle
+                // poll provides the bound. Once observed, a durable pending clock
+                // survives repeated retries without masking stalled ingestion.
+                let pending_since = status.pending_work_since.or(
+                    match (status.last_seen_rpc_tip, status.last_indexed_height) {
+                        (Some(seen), Some(indexed)) if seen <= indexed => status.last_tip_check_at,
+                        _ => None,
+                    },
+                );
+                match pending_since {
+                    Some(0) | None => {
+                        reasons.push("pending work clock missing".to_string());
+                        reason_codes.push("pending_work_clock_missing");
+                    }
+                    Some(pending_since) if pending_since > now => {
+                        reasons.push("pending work clock is in the future".to_string());
+                        reason_codes.push("pending_work_clock_future");
+                    }
+                    Some(pending_since) => {
+                        let age = now - timestamp.max(pending_since);
+                        if age > max_heartbeat_age {
+                            reasons.push(format!(
+                                "ingest progress age {}s exceeds threshold {}s while blocks are pending",
+                                age, max_heartbeat_age
+                            ));
+                            reason_codes.push("ingest_stalled");
+                        }
+                    }
+                }
             }
         }
-        None => reasons.push("success heartbeat missing".to_string()),
     }
 
     if status.failure.consecutive_failures > max_consecutive_failures {
@@ -113,6 +162,7 @@ fn assess_health(
             "consecutive failures {} exceeds threshold {}",
             status.failure.consecutive_failures, max_consecutive_failures
         ));
+        reason_codes.push("consecutive_failures");
     }
     if let Some(metrics) = status.live_metrics.as_ref() {
         if metrics.elapsed_ms > max_ingest_ms {
@@ -120,12 +170,14 @@ fn assess_health(
                 "last ingest latency {}ms exceeds threshold {}ms",
                 metrics.elapsed_ms, max_ingest_ms
             ));
+            reason_codes.push("ingest_latency");
         }
     }
 
     HealthAssessment {
         healthy: reasons.is_empty(),
         reasons,
+        reason_codes,
     }
 }
 
@@ -135,6 +187,7 @@ async fn collect_status(config: &Config) -> Result<IndexerStatus, String> {
     let mut last_seen_rpc_tip = None;
     let mut last_tip_check_at = None;
     let mut last_success_at = None;
+    let mut pending_work_since = None;
     let mut live_metrics = None;
     let mut failure = FailureState {
         height: None,
@@ -149,73 +202,49 @@ async fn collect_status(config: &Config) -> Result<IndexerStatus, String> {
             .await
             .map_err(|e| format!("PostgreSQL status error: {}", e))?;
 
-        last_indexed_height = parse_optional_u32(
-            postgres
-                .get_state("last_indexed_height")
-                .await
-                .map_err(|e| format!("Status read error: {}", e))?,
-        );
-        backfill_height = parse_optional_u32(
-            postgres
-                .get_state("backfill_height")
-                .await
-                .map_err(|e| format!("Status read error: {}", e))?,
-        );
-        last_seen_rpc_tip = parse_optional_u32(
-            postgres
-                .get_state("last_seen_rpc_tip")
-                .await
-                .map_err(|e| format!("Status read error: {}", e))?,
-        );
-        last_tip_check_at = parse_optional_u64(
-            postgres
-                .get_state("last_tip_check_at")
-                .await
-                .map_err(|e| format!("Status read error: {}", e))?,
-        );
-        last_success_at = parse_optional_u64(
-            postgres
-                .get_state("last_success_at")
-                .await
-                .map_err(|e| format!("Status read error: {}", e))?,
-        );
-        live_metrics = postgres
-            .get_state("last_live_metrics")
+        let state = postgres
+            .get_states(&[
+                "last_indexed_height",
+                "backfill_height",
+                "last_seen_rpc_tip",
+                "last_tip_check_at",
+                "last_success_at",
+                "pending_work_since",
+                "last_live_metrics",
+                "last_failed_height",
+                "last_failed_mode",
+                "last_failed_error",
+                "last_failed_at",
+                "consecutive_failure_count",
+            ])
             .await
-            .map_err(|e| format!("Status read error: {}", e))?
+            .map_err(|e| format!("Status read error: {}", e))?;
+        last_indexed_height = parse_optional_u32(state.get("last_indexed_height").cloned());
+        backfill_height = parse_optional_u32(state.get("backfill_height").cloned());
+        last_seen_rpc_tip = parse_optional_u32(state.get("last_seen_rpc_tip").cloned());
+        last_tip_check_at = parse_optional_u64(state.get("last_tip_check_at").cloned());
+        last_success_at = parse_optional_u64(state.get("last_success_at").cloned());
+        pending_work_since = match state.get("pending_work_since") {
+            Some(value) => Some(
+                value
+                    .parse::<u64>()
+                    .map_err(|_| "Invalid pending work clock".to_string())?,
+            ),
+            None => None,
+        };
+        live_metrics = state
+            .get("last_live_metrics")
             .map(|value| {
-                serde_json::from_str(&value)
+                serde_json::from_str(value)
                     .map_err(|e| format!("Invalid live metrics in indexer_state: {e}"))
             })
             .transpose()?;
-
-        failure.height = parse_optional_u32(
-            postgres
-                .get_state("last_failed_height")
-                .await
-                .map_err(|e| format!("Status read error: {}", e))?,
-        );
-        failure.mode = postgres
-            .get_state("last_failed_mode")
-            .await
-            .map_err(|e| format!("Status read error: {}", e))?;
-        failure.error = postgres
-            .get_state("last_failed_error")
-            .await
-            .map_err(|e| format!("Status read error: {}", e))?;
-        failure.timestamp = parse_optional_u64(
-            postgres
-                .get_state("last_failed_at")
-                .await
-                .map_err(|e| format!("Status read error: {}", e))?,
-        );
-        failure.consecutive_failures = parse_optional_u32(
-            postgres
-                .get_state("consecutive_failure_count")
-                .await
-                .map_err(|e| format!("Status read error: {}", e))?,
-        )
-        .unwrap_or(0);
+        failure.height = parse_optional_u32(state.get("last_failed_height").cloned());
+        failure.mode = state.get("last_failed_mode").cloned();
+        failure.error = state.get("last_failed_error").cloned();
+        failure.timestamp = parse_optional_u64(state.get("last_failed_at").cloned());
+        failure.consecutive_failures =
+            parse_optional_u32(state.get("consecutive_failure_count").cloned()).unwrap_or(0);
     }
 
     let (chain_tip, chain_tip_source) = match crate::db::ZebraRpc::from_env() {
@@ -251,6 +280,7 @@ async fn collect_status(config: &Config) -> Result<IndexerStatus, String> {
         last_seen_rpc_tip,
         last_tip_check_at,
         last_success_at,
+        pending_work_since,
         live_metrics,
         failure,
     })
@@ -398,6 +428,7 @@ pub(crate) async fn check_health(
             serde_json::to_string_pretty(&serde_json::json!({
                 "healthy": assessment.healthy,
                 "reasons": assessment.reasons,
+                "reason_codes": assessment.reason_codes,
                 "status": status,
             }))
             .map_err(|e| format!("Health serialization error: {}", e))?
@@ -450,6 +481,7 @@ mod health_tests {
             last_seen_rpc_tip: Some(100),
             last_tip_check_at: Some(NOW - 60),
             last_success_at: Some(NOW - 30),
+            pending_work_since: lag_blocks.filter(|lag| *lag > 0).map(|_| NOW - 60),
             live_metrics: Some(LiveMetrics {
                 height: 100,
                 rpc_tip: 100,
@@ -541,16 +573,126 @@ mod health_tests {
     }
 
     #[test]
-    fn health_fails_when_success_heartbeat_is_stale() {
-        let mut status = sample_status(Some(0), 0);
+    fn health_fails_when_ingestion_stops_with_pending_blocks() {
+        let mut status = sample_status(Some(1), 0);
         status.last_success_at = Some(NOW - 601);
+        status.pending_work_since = Some(NOW - 601);
 
         let assessment = assess_health(&status, 3, 0, 600, 5_000, NOW);
         assert!(!assessment.healthy);
         assert!(assessment
             .reasons
             .iter()
-            .any(|reason| reason.contains("success heartbeat age")));
+            .any(|reason| reason.contains("ingest progress age")));
+    }
+
+    #[test]
+    fn caught_up_indexer_can_wait_indefinitely_with_fresh_tip_polls() {
+        let mut status = sample_status(Some(0), 0);
+        status.last_success_at = Some(NOW - 86_400);
+        let assessment = assess_health(&status, 3, 0, 600, 5_000, NOW);
+        assert!(assessment.healthy, "{:?}", assessment.reasons);
+    }
+
+    #[test]
+    fn stopped_idle_indexer_is_unhealthy_even_when_node_has_no_new_block() {
+        let mut status = sample_status(Some(0), 0);
+        status.last_success_at = Some(NOW - 86_400);
+        status.last_tip_check_at = Some(NOW - 601);
+        let assessment = assess_health(&status, 3, 0, 600, 5_000, NOW);
+        assert!(!assessment.healthy);
+        assert_eq!(assessment.reason_codes, ["tip_heartbeat_stale"]);
+    }
+
+    #[test]
+    fn missing_or_future_heartbeat_cannot_certify_a_live_indexer() {
+        for timestamp in [None, Some(NOW + 1)] {
+            let mut status = sample_status(Some(0), 0);
+            status.last_tip_check_at = timestamp;
+            let assessment = assess_health(&status, 3, 0, 600, 5_000, NOW);
+            assert!(!assessment.healthy);
+        }
+        let mut status = sample_status(Some(0), 0);
+        status.last_success_at = Some(NOW + 1);
+        assert!(!assess_health(&status, 3, 0, 600, 5_000, NOW).healthy);
+    }
+
+    #[test]
+    fn zero_clocks_never_certify_liveness_or_progress() {
+        let mut status = sample_status(Some(0), 0);
+        status.last_tip_check_at = Some(0);
+        assert_eq!(
+            assess_health(&status, 3, 0, 600, 5_000, NOW).reason_codes,
+            ["tip_heartbeat_missing"]
+        );
+        status.last_tip_check_at = Some(NOW);
+        status.last_success_at = Some(0);
+        assert_eq!(
+            assess_health(&status, 3, 0, 600, 5_000, NOW).reason_codes,
+            ["success_heartbeat_missing"]
+        );
+        status.last_success_at = Some(NOW);
+        status.pending_work_since = Some(0);
+        assert_eq!(
+            assess_health(&status, 3, 0, 600, 5_000, NOW).reason_codes,
+            ["pending_work_clock_missing"]
+        );
+    }
+
+    #[test]
+    fn heartbeat_threshold_is_inclusive_and_missing_success_stays_unhealthy() {
+        let mut status = sample_status(Some(1), 0);
+        status.last_success_at = Some(NOW - 600);
+        status.last_tip_check_at = Some(NOW - 600);
+        status.pending_work_since = Some(NOW - 600);
+        assert!(assess_health(&status, 3, 0, 600, 5_000, NOW).healthy);
+        status.last_success_at = None;
+        let assessment = assess_health(&status, 3, 0, 600, 5_000, NOW);
+        assert_eq!(assessment.reason_codes, ["success_heartbeat_missing"]);
+    }
+
+    #[test]
+    fn new_block_after_long_idle_receives_a_full_ingestion_grace_period() {
+        let mut status = sample_status(Some(1), 0);
+        status.last_success_at = Some(NOW - 86_400);
+        status.pending_work_since = Some(NOW - 1);
+        assert!(assess_health(&status, 3, 0, 600, 5_000, NOW).healthy);
+        status.pending_work_since = Some(NOW - 600);
+        assert!(assess_health(&status, 3, 0, 600, 5_000, NOW).healthy);
+        status.pending_work_since = Some(NOW - 601);
+        let assessment = assess_health(&status, 3, 0, 600, 5_000, NOW);
+        assert_eq!(assessment.reason_codes, ["ingest_stalled"]);
+    }
+
+    #[test]
+    fn repeated_same_height_reorg_failures_cannot_hide_behind_fresh_polling() {
+        let mut status = sample_status(Some(0), 0);
+        status.last_success_at = Some(NOW - 86_400);
+        status.pending_work_since = Some(NOW - 601);
+        let assessment = assess_health(&status, 3, 0, 600, 5_000, NOW);
+        assert_eq!(assessment.reason_codes, ["ingest_stalled"]);
+    }
+
+    #[test]
+    fn fresh_success_extends_progress_window_for_a_remaining_backlog() {
+        let mut status = sample_status(Some(1), 0);
+        status.pending_work_since = Some(NOW - 86_400);
+        assert!(assess_health(&status, 3, 0, 600, 5_000, NOW).healthy);
+    }
+
+    #[test]
+    fn missing_pending_clock_only_gets_grace_until_writer_observes_new_work() {
+        let mut status = sample_status(Some(1), 0);
+        status.last_success_at = Some(NOW - 86_400);
+        status.pending_work_since = None;
+        status.last_seen_rpc_tip = status.last_indexed_height;
+        assert!(assess_health(&status, 3, 0, 600, 5_000, NOW).healthy);
+        status.last_seen_rpc_tip = Some(status.chain_tip);
+        let assessment = assess_health(&status, 3, 0, 600, 5_000, NOW);
+        assert_eq!(assessment.reason_codes, ["pending_work_clock_missing"]);
+        status.pending_work_since = Some(NOW + 1);
+        let assessment = assess_health(&status, 3, 0, 600, 5_000, NOW);
+        assert_eq!(assessment.reason_codes, ["pending_work_clock_future"]);
     }
 
     #[test]

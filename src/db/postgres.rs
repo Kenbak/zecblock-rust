@@ -118,6 +118,49 @@ impl PostgresWriter {
         Ok(())
     }
 
+    /// Publish polling liveness and the beginning of outstanding work atomically.
+    /// Repeated polls preserve the first pending-work time. Only a confirmed
+    /// successful idle/reorg check clears it (`Some(false)`); `None` preserves it.
+    pub async fn update_live_tip(
+        &self,
+        rpc_tip: u32,
+        has_pending_work: Option<bool>,
+    ) -> Result<(), sqlx::Error> {
+        let now = crate::util::unix_timestamp_secs().to_string();
+        sqlx::query(
+            r#"
+            WITH heartbeat AS (
+                INSERT INTO indexer_state (key, value, updated_at)
+                SELECT key, value, NOW()
+                FROM UNNEST($1::text[], $2::text[]) AS heartbeat(key, value)
+                ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()
+            ), pending AS (
+                INSERT INTO indexer_state (key, value, updated_at)
+                SELECT 'pending_work_since', $3, NOW() WHERE $4 IS TRUE
+                ON CONFLICT (key) DO NOTHING
+            )
+            DELETE FROM indexer_state WHERE key = 'pending_work_since' AND $4 IS FALSE
+            "#,
+        )
+        .bind(["last_seen_rpc_tip", "last_tip_check_at"])
+        .bind([rpc_tip.to_string(), now.clone()])
+        .bind(now)
+        .bind(has_pending_work)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Read related status values from one PostgreSQL statement snapshot.
+    pub async fn get_states(&self, keys: &[&str]) -> Result<HashMap<String, String>, sqlx::Error> {
+        let rows: Vec<(String, String)> =
+            sqlx::query_as("SELECT key, value FROM indexer_state WHERE key = ANY($1)")
+                .bind(keys)
+                .fetch_all(&self.pool)
+                .await?;
+        Ok(rows.into_iter().collect())
+    }
+
     /// Get indexer state value
     pub async fn get_state(&self, key: &str) -> Result<Option<String>, sqlx::Error> {
         let result: Option<(String,)> =
@@ -1729,6 +1772,80 @@ impl PostgresWriter {
 
 #[cfg(test)]
 mod integrity_write_tests {
+    #[tokio::test]
+    async fn live_tip_clock_survives_retries_and_clears_only_when_confirmed_idle() {
+        let Ok(database_url) = std::env::var("DATABASE_URL") else {
+            eprintln!("Skipping pending-work database test: DATABASE_URL is not set");
+            return;
+        };
+        // A per-connection temporary table keeps this test isolated from indexed
+        // state and other tests, even if they use the same disposable database.
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .after_connect(|connection, _| Box::pin(async move {
+                sqlx::query("CREATE TEMP TABLE indexer_state (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TIMESTAMPTZ)")
+                    .execute(connection).await?;
+                Ok(())
+            }))
+            .connect(&database_url)
+            .await
+            .expect("connect isolated health-clock test");
+        let writer = super::PostgresWriter { pool };
+        writer
+            .update_checkpoint("last_success_at", "100")
+            .await
+            .unwrap();
+        writer.update_live_tip(101, Some(true)).await.unwrap();
+        assert!(writer
+            .get_state("pending_work_since")
+            .await
+            .unwrap()
+            .is_some());
+        writer
+            .update_checkpoint("pending_work_since", "123")
+            .await
+            .unwrap();
+        writer.update_live_tip(102, Some(true)).await.unwrap();
+        writer.update_live_tip(102, None).await.unwrap();
+        let state = writer
+            .get_states(&[
+                "pending_work_since",
+                "last_success_at",
+                "last_seen_rpc_tip",
+                "last_tip_check_at",
+            ])
+            .await
+            .unwrap();
+        assert_eq!(state["pending_work_since"], "123");
+        assert_eq!(state["last_success_at"], "100");
+        assert_eq!(state["last_seen_rpc_tip"], "102");
+        assert!(state["last_tip_check_at"].parse::<u64>().unwrap() > 123);
+        writer.update_live_tip(102, Some(false)).await.unwrap();
+        assert!(writer
+            .get_state("pending_work_since")
+            .await
+            .unwrap()
+            .is_none());
+        writer.update_live_tip(103, Some(true)).await.unwrap();
+        assert_ne!(
+            writer
+                .get_state("pending_work_since")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("123")
+        );
+        assert_eq!(
+            writer
+                .get_state("last_success_at")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("100")
+        );
+        writer.pool.close().await;
+    }
+
     #[test]
     fn funding_recipients_are_never_miner_candidates() {
         use super::miner_address_candidate;
