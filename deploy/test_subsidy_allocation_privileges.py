@@ -13,6 +13,23 @@ from urllib.parse import urlsplit, urlunsplit
 import uuid
 
 
+# ACL arrays have no stable item order after REVOKE/GRANT. Compare every native
+# privilege field, retaining duplicate entries and NULL versus explicit empty ACLs.
+ACL_SNAPSHOT_SQL = """
+    SELECT jsonb_build_object(
+        'is_null', input.acl IS NULL,
+        'entries', (
+            SELECT COALESCE(jsonb_agg(to_jsonb(entry) ORDER BY
+                entry.grantor, entry.grantee, entry.privilege_type,
+                entry.is_grantable), '[]'::jsonb)
+            FROM aclexplode(CASE WHEN cardinality(input.acl) = 0
+                THEN NULL::aclitem[] ELSE input.acl END) AS entry
+        )
+    )
+    FROM acl_input AS input
+"""
+
+
 @unittest.skipUnless(os.environ.get("MIGRATION_TEST_DATABASE_URL"),
                      "disposable PostgreSQL administrator connection required")
 class SubsidyAllocationPrivilegeTests(unittest.TestCase):
@@ -64,6 +81,41 @@ class SubsidyAllocationPrivilegeTests(unittest.TestCase):
             )
         """))
 
+    def acl_snapshot(self, query=None):
+        if query is None:
+            query = "SELECT relacl AS acl FROM pg_class WHERE oid = 'public.block_subsidy_allocations'::regclass"
+        return json.loads(self.sql("WITH acl_input AS (" + query + ") " + ACL_SNAPSHOT_SQL))
+
+    def test_acl_snapshot_ignores_order_without_ignoring_permission_changes(self):
+        r = self.roles
+        items = [f"{r['reader']}=r/{r['writer']}", f"{r['group']}=ar*/{r['writer']}",
+                 f"=r/{r['writer']}"]
+
+        def array_query(entries):
+            return "SELECT ARRAY[" + ",".join("'" + entry + "'::aclitem" for entry in entries) + "] AS acl"
+
+        forward = array_query(items)
+        reverse = array_query(list(reversed(items)))
+        self.assertNotEqual(self.sql("SELECT acl::text FROM (" + forward + ") AS fixture"),
+                            self.sql("SELECT acl::text FROM (" + reverse + ") AS fixture"))
+        self.assertEqual(self.acl_snapshot(forward), self.acl_snapshot(reverse))
+        self.assertTrue(any(int(entry['grantee']) == 0 for entry in self.acl_snapshot(forward)['entries']))
+
+        baseline = self.acl_snapshot(array_query(items[:1]))
+        variants = {
+            'grantor': f"{r['reader']}=r/{r['delegate']}",
+            'grantee': f"{r['group']}=r/{r['writer']}",
+            'privilege': f"{r['reader']}=w/{r['writer']}",
+            'grant option': f"{r['reader']}=r*/{r['writer']}",
+            'PUBLIC': f"=r/{r['writer']}",
+        }
+        for field, item in variants.items():
+            with self.subTest(field=field):
+                self.assertNotEqual(self.acl_snapshot(array_query([item])), baseline)
+        self.assertNotEqual(self.acl_snapshot(array_query(items[:1] * 2)), baseline)
+        self.assertNotEqual(self.acl_snapshot("SELECT NULL::aclitem[] AS acl"),
+                            self.acl_snapshot("SELECT '{}'::aclitem[] AS acl"))
+
     def test_default_all_and_inherited_grants_are_restricted_without_data_changes(self):
         r = self.roles
         self.sql(f"""
@@ -92,10 +144,10 @@ class SubsidyAllocationPrivilegeTests(unittest.TestCase):
         before = self.snapshot()
         self.migration("037")
         self.assertEqual(self.snapshot(), before)
-        after_acl = self.sql("SELECT relacl::text FROM pg_class WHERE oid = 'public.block_subsidy_allocations'::regclass")
+        after_acl = self.acl_snapshot()
         self.migration("037")
         self.assertEqual(self.snapshot(), before)
-        self.assertEqual(self.sql("SELECT relacl::text FROM pg_class WHERE oid = 'public.block_subsidy_allocations'::regclass"), after_acl)
+        self.assertEqual(self.acl_snapshot(), after_acl)
 
         # Check every privilege known to this PostgreSQL version. This includes
         # MAINTAIN on 17+, without spelling it in SQL accepted by older servers.
