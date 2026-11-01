@@ -59,6 +59,14 @@ impl ZebraState {
         })
     }
 
+    /// Replay the primary's latest MANIFEST and WAL into this secondary view.
+    /// Without it, blocks Zebra has not yet flushed to SST files are invisible.
+    pub fn catch_up_with_primary(&self) -> Result<(), String> {
+        self.db
+            .try_catch_up_with_primary()
+            .map_err(|e| format!("RocksDB secondary catch-up failed: {}", e))
+    }
+
     /// Get current chain tip height
     pub fn get_tip_height(&self) -> Result<u32, String> {
         let cf = self

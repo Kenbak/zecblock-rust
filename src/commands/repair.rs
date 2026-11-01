@@ -273,6 +273,8 @@ pub(crate) async fn repair_sprout_fees(
     let window = window.clamp(1, MAX_REPAIR_WINDOW);
 
     let zebra = ZebraState::open(config)?;
+    // Include blocks still only in the node's WAL (recent tip history).
+    zebra.catch_up_with_primary()?;
     let tip = zebra.get_tip_height()?;
     if to > tip {
         return Err(format!("--to {to} is above the node tip {tip}"));
@@ -566,7 +568,8 @@ async fn repair_window(
                 continue;
             }
             if !sprout_set.contains(tx.txid.as_str()) {
-                if stored.fee != tx.fee {
+                // Coinbase rows have no fee; legacy rows store 0 there.
+                if !tx.is_coinbase() && stored.fee != tx.fee {
                     report.other_fee_mismatches += 1;
                     push_sample(
                         &mut report.anomaly_samples,
