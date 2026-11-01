@@ -253,6 +253,8 @@ struct BlockPlan {
 /// Recompute Sprout value balances, fees, block fee totals and flows from the
 /// node's raw blocks for a bounded height range. Resumable through
 /// indexer_state.sprout_fee_repair_height (advanced only by real runs).
+/// `no_resume` ignores and never writes that shared checkpoint, for parallel
+/// or targeted range runs; writes are idempotent, so reruns are safe.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn repair_sprout_fees(
     config: &Config,
@@ -260,6 +262,7 @@ pub(crate) async fn repair_sprout_fees(
     to: u32,
     window: u32,
     dry_run: bool,
+    no_resume: bool,
     samples: usize,
     lock_timeout_ms: u64,
     statement_timeout_ms: u64,
@@ -283,7 +286,8 @@ pub(crate) async fn repair_sprout_fees(
         .await
         .map_err(|e| format!("PostgreSQL error: {}", e))?;
 
-    let start = if dry_run {
+    let checkpoint = !dry_run && !no_resume;
+    let start = if !checkpoint {
         from
     } else {
         match postgres
@@ -324,6 +328,7 @@ pub(crate) async fn repair_sprout_fees(
             current,
             window_end,
             dry_run,
+            checkpoint,
             samples,
             lock_timeout_ms,
             statement_timeout_ms,
@@ -356,6 +361,7 @@ async fn repair_window(
     from: u32,
     to: u32,
     dry_run: bool,
+    checkpoint: bool,
     samples: usize,
     lock_timeout_ms: u64,
     statement_timeout_ms: u64,
@@ -405,7 +411,7 @@ async fn repair_window(
         });
     }
     if plans.is_empty() {
-        if !dry_run {
+        if checkpoint {
             save_checkpoint(postgres, to).await?;
         }
         return Ok(());
@@ -638,15 +644,17 @@ async fn repair_window(
     write_tx_updates(&mut db_tx, &tx_updates).await?;
     write_block_updates(&mut db_tx, &block_updates).await?;
     write_flow_rewrites(&mut db_tx, &flow_rewrites).await?;
-    sqlx::query(
-        "INSERT INTO indexer_state (key, value, updated_at) VALUES ($1, $2, NOW()) \
+    if checkpoint {
+        sqlx::query(
+            "INSERT INTO indexer_state (key, value, updated_at) VALUES ($1, $2, NOW()) \
          ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()",
-    )
-    .bind(SPROUT_REPAIR_CHECKPOINT)
-    .bind(to.to_string())
-    .execute(&mut *db_tx)
-    .await
-    .map_err(|e| format!("checkpoint write failed: {e}"))?;
+        )
+        .bind(SPROUT_REPAIR_CHECKPOINT)
+        .bind(to.to_string())
+        .execute(&mut *db_tx)
+        .await
+        .map_err(|e| format!("checkpoint write failed: {e}"))?;
+    }
     db_tx
         .commit()
         .await
