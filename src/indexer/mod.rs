@@ -599,18 +599,7 @@ impl Indexer {
                 tx.transparent_value_in = total_input;
             }
 
-            if !tx.is_coinbase() {
-                let fee = tx
-                    .transparent_value_in
-                    .checked_sub(tx.transparent_value_out)
-                    .and_then(|value| value.checked_add(tx.sapling_value_balance))
-                    .and_then(|value| value.checked_add(tx.orchard_value_balance))
-                    .and_then(|value| value.checked_add(tx.ironwood_value_balance))
-                    .ok_or_else(|| format!("fee overflow for {}", tx.txid))?;
-                if fee >= 0 {
-                    tx.fee = Some(fee);
-                }
-            }
+            tx.fee = tx.compute_fee()?;
 
             flows.extend(ShieldedFlow::from_transaction(tx));
         }

@@ -246,6 +246,28 @@ enum Commands {
         dry_run: bool,
     },
 
+    /// Recompute Sprout value balances, fees, block fee totals and flows from
+    /// the node's raw blocks for a bounded height range (resumable).
+    RepairSproutFees {
+        #[arg(long)]
+        from: u32,
+        #[arg(long)]
+        to: u32,
+        /// Blocks per database transaction (max 10000)
+        #[arg(long, default_value = "1000")]
+        window: u32,
+        /// Report counts and sample diffs without writing or checkpointing
+        #[arg(long)]
+        dry_run: bool,
+        /// Sample diffs to print per category
+        #[arg(long, default_value = "20")]
+        samples: usize,
+        #[arg(long, default_value = "5000")]
+        lock_timeout_ms: u64,
+        #[arg(long, default_value = "600000")]
+        statement_timeout_ms: u64,
+    },
+
     /// NU7 capacity benchmark: replay blocks from RocksDB into an isolated DB
     Benchmark {
         /// Database URL for benchmark writes (isolated test DB)
@@ -452,6 +474,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Commands::RepairFees { batch, dry_run } => {
             commands::repair::repair_ironwood_fees(&config, batch, dry_run).await?;
+        }
+        Commands::RepairSproutFees {
+            from,
+            to,
+            window,
+            dry_run,
+            samples,
+            lock_timeout_ms,
+            statement_timeout_ms,
+        } => {
+            commands::repair::repair_sprout_fees(
+                &config,
+                from,
+                to,
+                window,
+                dry_run,
+                samples,
+                lock_timeout_ms,
+                statement_timeout_ms,
+            )
+            .await?;
         }
         Commands::Benchmark {
             benchmark_db,
