@@ -1,5 +1,5 @@
 use crate::config::Config;
-use crate::db::{PostgresWriter, ZebraState};
+use crate::db::{PostgresWriter, ZebraRpc, ZebraState};
 use crate::models::{ShieldedFlow, Transaction};
 use sqlx::{Postgres, Row};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -243,6 +243,157 @@ struct SproutRepairReport {
     anomaly_samples: Vec<String>,
 }
 
+/// Where raw blocks come from. RocksDB is fast for history; RPC also serves
+/// tip blocks that the node has not yet flushed to SST files, which a
+/// secondary RocksDB view cannot see.
+enum BlockSource {
+    Rocks(ZebraState),
+    Rpc(ZebraRpc),
+}
+
+impl BlockSource {
+    async fn tip(&self) -> Result<u32, String> {
+        match self {
+            BlockSource::Rocks(zebra) => zebra.get_tip_height(),
+            BlockSource::Rpc(rpc) => u32::try_from(rpc.get_block_count().await?)
+                .map_err(|_| "RPC tip out of range".to_string()),
+        }
+    }
+
+    /// Parse one block; returns its hash and transactions (inputs unresolved).
+    async fn load(
+        &self,
+        height: u32,
+        network: crate::config::Network,
+    ) -> Result<(String, Vec<Transaction>), String> {
+        use crate::indexer::TransactionParser;
+        match self {
+            BlockSource::Rocks(zebra) => {
+                let hash = crate::util::display_hash(&zebra.get_block_hash(height)?);
+                let mut transactions = Vec::new();
+                for (index, raw) in zebra.iter_block_transactions(height)? {
+                    transactions.push(
+                        TransactionParser::parse(&raw, height, &hash, network)
+                            .map_err(|e| format!("parse error at {height}:{index}: {e}"))?,
+                    );
+                }
+                Ok((hash, transactions))
+            }
+            BlockSource::Rpc(rpc) => {
+                use zakura_chain::block::Block;
+                use zakura_chain::serialization::{ZcashDeserialize, ZcashSerialize};
+                let hash = rpc.get_block_hash(u64::from(height)).await?;
+                let raw = hex::decode(rpc.get_raw_block_hex(&hash).await?)
+                    .map_err(|e| format!("invalid block hex at {height}: {e}"))?;
+                let block = Block::zcash_deserialize(&mut std::io::Cursor::new(&raw))
+                    .map_err(|e| format!("failed to deserialize block {height}: {e:?}"))?;
+                if block.hash().to_string() != hash {
+                    return Err(format!("block {height} hash mismatch"));
+                }
+                if block.coinbase_height().map(|h| h.0) != Some(height) {
+                    return Err(format!("block {height} coinbase height mismatch"));
+                }
+                let mut transactions = Vec::with_capacity(block.transactions.len());
+                for (index, tx) in block.transactions.iter().enumerate() {
+                    let mut bytes = Vec::new();
+                    tx.zcash_serialize(&mut bytes)
+                        .map_err(|e| format!("serialize error at {height}:{index}: {e}"))?;
+                    transactions.push(
+                        TransactionParser::parse(&bytes, height, &hash, network)
+                            .map_err(|e| format!("parse error at {height}:{index}: {e}"))?,
+                    );
+                }
+                Ok((hash, transactions))
+            }
+        }
+    }
+
+    /// Resolve every transparent input and compute fees for one full block.
+    async fn resolve(
+        &self,
+        postgres: &PostgresWriter,
+        transactions: &mut [Transaction],
+        network: crate::config::Network,
+    ) -> Result<(), String> {
+        use crate::indexer::TransactionParser;
+        match self {
+            BlockSource::Rocks(zebra) => {
+                TransactionParser::resolve_block_inputs(transactions, zebra)
+            }
+            BlockSource::Rpc(rpc) => resolve_inputs_rpc(rpc, postgres, transactions, network).await,
+        }
+    }
+}
+
+/// Same-block outputs first, then stored outputs, then the node over RPC.
+async fn resolve_inputs_rpc(
+    rpc: &ZebraRpc,
+    postgres: &PostgresWriter,
+    transactions: &mut [Transaction],
+    network: crate::config::Network,
+) -> Result<(), String> {
+    use crate::indexer::TransactionParser;
+    let current: HashMap<(String, u32), (i64, Option<String>)> = transactions
+        .iter()
+        .flat_map(|tx| {
+            tx.vout
+                .iter()
+                .map(move |o| ((tx.txid.clone(), o.n), (o.value, o.address.clone())))
+        })
+        .collect();
+    let mut references: Vec<(String, u32)> = transactions
+        .iter()
+        .flat_map(|tx| {
+            tx.vin
+                .iter()
+                .filter(|i| !i.is_coinbase)
+                .map(|i| (i.txid.clone(), i.vout))
+        })
+        .filter(|key| !current.contains_key(key))
+        .collect();
+    references.sort_unstable();
+    references.dedup();
+    let stored = postgres
+        .get_prev_outputs(&references)
+        .await
+        .map_err(|e| format!("prevout database lookup failed: {e}"))?;
+    let mut fetched: HashMap<String, Transaction> = HashMap::new();
+    for tx in transactions.iter_mut() {
+        if tx.is_coinbase() {
+            tx.fee = None;
+            continue;
+        }
+        let mut total = 0i64;
+        for input in tx.vin.iter_mut() {
+            let key = (input.txid.clone(), input.vout);
+            let (value, address) = match current.get(&key).or_else(|| stored.get(&key)) {
+                Some(found) => found.clone(),
+                None => {
+                    if !fetched.contains_key(&input.txid) {
+                        let raw = hex::decode(rpc.get_raw_transaction_hex(&input.txid).await?)
+                            .map_err(|e| format!("invalid prevout hex: {e}"))?;
+                        let parsed = TransactionParser::parse(&raw, 0, "", network)?;
+                        fetched.insert(input.txid.clone(), parsed);
+                    }
+                    let output = fetched
+                        .get(&input.txid)
+                        .and_then(|prev| prev.vout.get(input.vout as usize))
+                        .ok_or_else(|| format!("missing prevout {}:{}", input.txid, input.vout))?;
+                    (output.value, output.address.clone())
+                }
+            };
+            input.value = Some(value);
+            input.address = address;
+            total = total
+                .checked_add(value)
+                .ok_or_else(|| format!("transparent input overflow for {}", tx.txid))?;
+        }
+        tx.transparent_value_in = total;
+        tx.fee = tx.compute_fee()?;
+    }
+    Ok(())
+}
+
 struct BlockPlan {
     height: u32,
     hash: String,
@@ -263,6 +414,7 @@ pub(crate) async fn repair_sprout_fees(
     window: u32,
     dry_run: bool,
     no_resume: bool,
+    rpc_source: bool,
     samples: usize,
     lock_timeout_ms: u64,
     statement_timeout_ms: u64,
@@ -275,10 +427,15 @@ pub(crate) async fn repair_sprout_fees(
     }
     let window = window.clamp(1, MAX_REPAIR_WINDOW);
 
-    let zebra = ZebraState::open(config)?;
-    // Include blocks still only in the node's WAL (recent tip history).
-    zebra.catch_up_with_primary()?;
-    let tip = zebra.get_tip_height()?;
+    let source = if rpc_source {
+        BlockSource::Rpc(ZebraRpc::from_env()?)
+    } else {
+        let zebra = ZebraState::open(config)?;
+        // Include blocks still only in the node's WAL (recent tip history).
+        zebra.catch_up_with_primary()?;
+        BlockSource::Rocks(zebra)
+    };
+    let tip = source.tip().await?;
     if to > tip {
         return Err(format!("--to {to} is above the node tip {tip}"));
     }
@@ -322,7 +479,7 @@ pub(crate) async fn repair_sprout_fees(
     loop {
         let window_end = current.saturating_add(window - 1).min(to);
         repair_window(
-            &zebra,
+            &source,
             &postgres,
             config,
             current,
@@ -355,7 +512,7 @@ pub(crate) async fn repair_sprout_fees(
 
 #[allow(clippy::too_many_arguments)]
 async fn repair_window(
-    zebra: &ZebraState,
+    source: &BlockSource,
     postgres: &PostgresWriter,
     config: &Config,
     from: u32,
@@ -367,8 +524,6 @@ async fn repair_window(
     statement_timeout_ms: u64,
     report: &mut SproutRepairReport,
 ) -> Result<(), String> {
-    use crate::indexer::TransactionParser;
-
     // Blocks the database already marks as Sprout must be rechecked even if
     // the node shows no JoinSplits, so stale flags are cleared too.
     let flagged: BTreeSet<i64> = sqlx::query_scalar(
@@ -386,20 +541,16 @@ async fn repair_window(
     let mut plans = Vec::new();
     for height in from..=to {
         report.blocks_scanned += 1;
-        let hash = crate::util::display_hash(&zebra.get_block_hash(height)?);
-        let mut transactions = Vec::new();
-        for (index, raw) in zebra.iter_block_transactions(height)? {
-            let tx = TransactionParser::parse(&raw, height, &hash, config.network)
-                .map_err(|e| format!("parse error at {height}:{index}: {e}"))?;
-            transactions.push(tx);
-        }
+        let (hash, mut transactions) = source.load(height, config.network).await?;
         let has_joinsplit = transactions.iter().any(|tx| tx.joinsplit_count > 0);
         if !has_joinsplit && !flagged.contains(&i64::from(height)) {
             continue;
         }
         // Full-block resolution keeps same-block prevouts exact and yields
         // every fee in the block, so the block total is node-derived too.
-        TransactionParser::resolve_block_inputs(&mut transactions, zebra)?;
+        source
+            .resolve(postgres, &mut transactions, config.network)
+            .await?;
         let total_fees = crate::db::postgres::block_total_fees(&transactions)
             .map_err(|e| format!("{e} at {height}"))?;
         report.sprout_blocks += 1;

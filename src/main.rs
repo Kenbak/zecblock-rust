@@ -263,6 +263,10 @@ enum Commands {
         /// targeted range runs; writes are idempotent)
         #[arg(long)]
         no_resume: bool,
+        /// Read blocks over the node RPC instead of RocksDB (needed for tip
+        /// blocks the node has not flushed yet; slower)
+        #[arg(long)]
+        rpc_source: bool,
         /// Sample diffs to print per category
         #[arg(long, default_value = "20")]
         samples: usize,
@@ -485,6 +489,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             window,
             dry_run,
             no_resume,
+            rpc_source,
             samples,
             lock_timeout_ms,
             statement_timeout_ms,
@@ -496,6 +501,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 window,
                 dry_run,
                 no_resume,
+                rpc_source,
                 samples,
                 lock_timeout_ms,
                 statement_timeout_ms,
