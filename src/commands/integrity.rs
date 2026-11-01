@@ -370,7 +370,13 @@ async fn repair(
         r#"
         UPDATE transactions chain_tx
         SET total_input=totals.total_input,
-            fee=totals.total_input + chain_tx.value_balance - chain_tx.total_output
+            -- value_balance excludes Sprout; an unknown Sprout balance or a
+            -- negative result leaves the fee unknown (NULL), never zero.
+            fee=CASE WHEN totals.total_input + chain_tx.value_balance
+                          + chain_tx.value_balance_sprout - chain_tx.total_output >= 0
+                     THEN totals.total_input + chain_tx.value_balance
+                          + chain_tx.value_balance_sprout - chain_tx.total_output
+                END
         FROM (
           SELECT input.txid,SUM(input.value) total_input
           FROM transaction_inputs input

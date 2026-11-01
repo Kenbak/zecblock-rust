@@ -115,6 +115,7 @@ fn coinbase_tx(txid: &str, height: u32, block_hash: &str, miner: &str, reward: i
         sapling_value_balance: 0,
         orchard_value_balance: 0,
         ironwood_value_balance: 0,
+        sprout_value_balance: 0,
         orchard_anchor: None,
         ironwood_anchor: None,
         fee: None,

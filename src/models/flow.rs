@@ -76,11 +76,15 @@ pub struct ShieldedFlow {
 
 impl ShieldedFlow {
     /// Analyze a transaction and extract flows
-    /// Matches Node.js behavior EXACTLY:
-    /// - Calculate NET total = sapling_value_balance + orchard_value_balance
+    /// - NET total = Sprout + Sapling + Orchard + Ironwood value balances
     /// - If total > 0 → ONE deshield flow
     /// - If total < 0 → ONE shield flow
-    /// - Pool = "mixed" if both pools have non-zero balance
+    /// - Pool = "mixed" if 2+ pools have non-zero balance
+    ///
+    /// Sprout counts like every other pool: t→Sprout deposits are shields,
+    /// Sprout→t withdrawals are deshields, and a Sprout→Sapling migration
+    /// with a transparent change output is a mixed deshield of the net amount,
+    /// never a Sapling shield.
     pub fn from_transaction(tx: &Transaction) -> Vec<ShieldedFlow> {
         let mut flows = Vec::new();
 
@@ -89,15 +93,11 @@ impl ShieldedFlow {
             return flows;
         }
 
-        // Calculate NET total across all shielded pools (Sapling + Orchard + Ironwood).
+        // Calculate NET total across all shielded pools.
         // Checked arithmetic: a malformed/adversarial value balance must not panic
         // the indexer. Zcash value balances are bounded well within i64, so this
         // is not expected to trigger on well-formed chain data.
-        let total_value_balance = match tx
-            .sapling_value_balance
-            .checked_add(tx.orchard_value_balance)
-            .and_then(|v| v.checked_add(tx.ironwood_value_balance))
-        {
+        let total_value_balance = match tx.shielded_value_balance() {
             Some(total) => total,
             None => {
                 eprintln!(
@@ -119,6 +119,7 @@ impl ShieldedFlow {
         // Post-NU6.3 the canonical migration is Orchard(+) → Ironwood(-).
         if tx.vin_count == 0 && tx.vout_count == 0 {
             let balances = [
+                tx.sprout_value_balance,
                 tx.sapling_value_balance,
                 tx.orchard_value_balance,
                 tx.ironwood_value_balance,
@@ -153,7 +154,8 @@ impl ShieldedFlow {
 
         // Determine pool type.
         // "mixed" if 2+ pools have non-zero balance (regardless of sign).
-        let active_pools = (tx.sapling_value_balance != 0) as u8
+        let active_pools = (tx.sprout_value_balance != 0) as u8
+            + (tx.sapling_value_balance != 0) as u8
             + (tx.orchard_value_balance != 0) as u8
             + (tx.ironwood_value_balance != 0) as u8;
         let pool = if active_pools >= 2 {
@@ -162,6 +164,8 @@ impl ShieldedFlow {
             Pool::Ironwood.to_string()
         } else if tx.orchard_value_balance != 0 {
             Pool::Orchard.to_string()
+        } else if tx.sprout_value_balance != 0 {
+            Pool::Sprout.to_string()
         } else {
             Pool::Sapling.to_string()
         };
@@ -225,6 +229,7 @@ mod tests {
             sapling_value_balance: 0,
             orchard_value_balance: 10000, // fee only
             ironwood_value_balance: 0,
+            sprout_value_balance: 0,
             orchard_anchor: None,
             ironwood_anchor: None,
             fee: Some(10000),
@@ -263,6 +268,7 @@ mod tests {
             sapling_value_balance: 5000000, // 0.05 ZEC leaving Sapling
             orchard_value_balance: -4990000, // ~0.05 ZEC entering Orchard (minus fee)
             ironwood_value_balance: 0,
+            sprout_value_balance: 0,
             orchard_anchor: None,
             ironwood_anchor: None,
             fee: Some(10000),
@@ -301,6 +307,7 @@ mod tests {
             sapling_value_balance: 0,
             orchard_value_balance: 10010000, // 0.1 ZEC + fee leaving Orchard
             ironwood_value_balance: -10000000, // 0.1 ZEC entering Ironwood
+            sprout_value_balance: 0,
             orchard_anchor: None,
             ironwood_anchor: None,
             fee: Some(10000),

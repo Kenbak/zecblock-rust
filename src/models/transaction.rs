@@ -30,6 +30,10 @@ pub struct Transaction {
     pub sapling_value_balance: i64,
     pub orchard_value_balance: i64,
     pub ironwood_value_balance: i64, // NU6.3 Ironwood pool (v6 tx)
+    /// Sprout JoinSplit value balance: sum(vpub_new) - sum(vpub_old) over
+    /// every JoinSplit (v2-v4). Positive = value leaving Sprout into the
+    /// transparent value pool of this transaction, matching the other pools.
+    pub sprout_value_balance: i64,
 
     // Anchor roots (hex-encoded 32-byte tree roots from shielded bundles)
     pub orchard_anchor: Option<String>,
@@ -48,6 +52,31 @@ pub struct Transaction {
 impl Transaction {
     pub fn is_coinbase(&self) -> bool {
         self.vin_count == 1 && self.vin.first().map(|v| v.is_coinbase).unwrap_or(false)
+    }
+
+    /// Net value leaving every shielded pool (Sprout, Sapling, Orchard,
+    /// Ironwood) into this transaction's transparent value pool.
+    pub fn shielded_value_balance(&self) -> Option<i64> {
+        self.sprout_value_balance
+            .checked_add(self.sapling_value_balance)?
+            .checked_add(self.orchard_value_balance)?
+            .checked_add(self.ironwood_value_balance)
+    }
+
+    /// Consensus fee: transparent inputs plus all shielded value balances
+    /// minus transparent outputs. `Ok(None)` means the fee is not knowable
+    /// (coinbase, or a negative result that a valid chain cannot produce);
+    /// callers must store NULL rather than a guessed zero.
+    pub fn compute_fee(&self) -> Result<Option<i64>, String> {
+        if self.is_coinbase() {
+            return Ok(None);
+        }
+        let fee = self
+            .shielded_value_balance()
+            .and_then(|balance| self.transparent_value_in.checked_add(balance))
+            .and_then(|value| value.checked_sub(self.transparent_value_out))
+            .ok_or_else(|| format!("fee overflow for {}", self.txid))?;
+        Ok((fee >= 0).then_some(fee))
     }
 }
 

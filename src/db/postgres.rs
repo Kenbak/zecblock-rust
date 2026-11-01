@@ -21,6 +21,19 @@ pub(crate) fn miner_address_candidate(address: Option<&str>) -> Option<String> {
         .map(str::to_owned)
 }
 
+/// Sum of non-coinbase fees for one block. `Ok(None)` when any non-coinbase
+/// fee is unknown: a partial sum would be published as a false total.
+pub fn block_total_fees(transactions: &[Transaction]) -> Result<Option<i64>, &'static str> {
+    let mut total = 0i64;
+    for tx in transactions.iter().filter(|tx| !tx.is_coinbase()) {
+        let Some(fee) = tx.fee else {
+            return Ok(None);
+        };
+        total = total.checked_add(fee).ok_or("block fee total overflow")?;
+    }
+    Ok(Some(total))
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct BlockWriteMetrics {
     pub metadata_us: u64,
@@ -293,15 +306,9 @@ impl PostgresWriter {
                     tx.txid
                 )));
             }
-            tx.sapling_value_balance
-                .checked_add(tx.orchard_value_balance)
-                .and_then(|value| value.checked_add(tx.ironwood_value_balance))
-                .ok_or_else(|| {
-                    sqlx::Error::Protocol(format!(
-                        "shielded value balance overflow for {}",
-                        tx.txid
-                    ))
-                })?;
+            tx.shielded_value_balance().ok_or_else(|| {
+                sqlx::Error::Protocol(format!("shielded value balance overflow for {}", tx.txid))
+            })?;
         }
         let mut db_tx = self.pool.begin().await?;
         // Block writers cooperate through a shared lock; integrity cutover and
@@ -324,12 +331,10 @@ impl PostgresWriter {
                 .await?;
         let mut count = 0u64;
 
-        // Calculate block-level aggregates
-        let total_fees = transactions
-            .iter()
-            .filter_map(|tx| tx.fee)
-            .try_fold(0i64, |total, fee| total.checked_add(fee))
-            .ok_or_else(|| sqlx::Error::Protocol("block fee total overflow".to_string()))?;
+        // Calculate block-level aggregates. One unknown non-coinbase fee makes
+        // the block total unknown (NULL), never a silent undercount.
+        let total_fees = block_total_fees(transactions)
+            .map_err(|error| sqlx::Error::Protocol(error.to_string()))?;
 
         // Block size = sum of all tx sizes + header size (~1487 bytes for Zcash)
         // Header: 4 (version) + 32 (prev_hash) + 32 (merkle) + 32 (reserved) + 4 (time)
@@ -465,13 +470,14 @@ impl PostgresWriter {
                     ironwood_actions, value_balance_ironwood, has_ironwood, value_balance,
                     expiry_height, sapling_spend_count, sapling_output_count,
                     sprout_joinsplit_count, has_sprout,
-                    orchard_anchor, ironwood_anchor, has_shielded_data
+                    orchard_anchor, ironwood_anchor, has_shielded_data,
+                    value_balance_sprout
                 ) VALUES (
                     $1, $2, $3, $4, $5, $6, $7, $8, $9,
                     $10, $11, $12, $13, $14, $15, $16, $17, $18, $19,
                     $20, $21, $22, $23,
                     $24, $25, $26, $27, $28,
-                    $29, $30, $31
+                    $29, $30, $31, $32
                 )
                 ON CONFLICT (txid) DO UPDATE SET
                     block_height = EXCLUDED.block_height,
@@ -493,7 +499,8 @@ impl PostgresWriter {
                     has_sprout = EXCLUDED.has_sprout,
                     orchard_anchor = EXCLUDED.orchard_anchor,
                     ironwood_anchor = EXCLUDED.ironwood_anchor,
-                    has_shielded_data = EXCLUDED.has_shielded_data
+                    has_shielded_data = EXCLUDED.has_shielded_data,
+                    value_balance_sprout = EXCLUDED.value_balance_sprout
                 "#,
                 )
                 .bind(&tx.txid) // $1
@@ -502,7 +509,7 @@ impl PostgresWriter {
                 .bind(tx.version) // $4
                 .bind(tx.lock_time as i64) // $5
                 .bind(tx.size as i32) // $6
-                .bind(tx.fee.unwrap_or(0)) // $7
+                .bind(tx.fee) // $7 (NULL when unknown, never 0)
                 .bind(tx.transparent_value_in) // $8
                 .bind(tx.transparent_value_out) // $9
                 .bind(tx.orchard_actions as i32) // $10
@@ -529,6 +536,7 @@ impl PostgresWriter {
                 .bind(&tx.orchard_anchor) // $29
                 .bind(&tx.ironwood_anchor) // $30
                 .bind(has_shielded_data) // $31
+                .bind(tx.sprout_value_balance) // $32
                 .execute(&mut *db_tx)
                 .await?;
 
@@ -834,7 +842,8 @@ impl PostgresWriter {
                     ironwood_actions, value_balance_ironwood, has_ironwood, value_balance,
                     expiry_height, sapling_spend_count, sapling_output_count,
                     sprout_joinsplit_count, has_sprout,
-                    orchard_anchor, ironwood_anchor, has_shielded_data
+                    orchard_anchor, ironwood_anchor, has_shielded_data,
+                    value_balance_sprout
                 ) "#,
             );
             query.push_values(chunk.iter().enumerate(), |mut row, (index, tx)| {
@@ -853,7 +862,7 @@ impl PostgresWriter {
                     .push_bind(tx.version)
                     .push_bind(tx.lock_time as i64)
                     .push_bind(tx.size as i32)
-                    .push_bind(tx.fee.unwrap_or(0))
+                    .push_bind(tx.fee)
                     .push_bind(tx.transparent_value_in)
                     .push_bind(tx.transparent_value_out)
                     .push_bind(tx.orchard_actions as i32)
@@ -877,7 +886,8 @@ impl PostgresWriter {
                     .push_bind(has_sprout)
                     .push_bind(&tx.orchard_anchor)
                     .push_bind(&tx.ironwood_anchor)
-                    .push_bind(has_shielded_data);
+                    .push_bind(has_shielded_data)
+                    .push_bind(tx.sprout_value_balance);
             });
             query.push(
                 r#"
@@ -901,7 +911,8 @@ impl PostgresWriter {
                     has_sprout = EXCLUDED.has_sprout,
                     orchard_anchor = EXCLUDED.orchard_anchor,
                     ironwood_anchor = EXCLUDED.ironwood_anchor,
-                    has_shielded_data = EXCLUDED.has_shielded_data
+                    has_shielded_data = EXCLUDED.has_shielded_data,
+                    value_balance_sprout = EXCLUDED.value_balance_sprout
                 "#,
             );
             query.build().execute(&mut **db_tx).await?;
@@ -1465,7 +1476,7 @@ impl PostgresWriter {
                    sprout_joinsplit_count,
                    value_balance, value_balance_sapling, value_balance_orchard, value_balance_ironwood,
                    flow_type, privacy_score, fork_event_id, first_indexed_at,
-                   orchard_anchor, ironwood_anchor
+                   orchard_anchor, ironwood_anchor, value_balance_sprout
                )
                SELECT
                    t.txid, t.block_height, t.block_hash, t.block_time, t.tx_index, t.version, t.locktime,
@@ -1476,7 +1487,7 @@ impl PostgresWriter {
                    t.sprout_joinsplit_count,
                    t.value_balance, t.value_balance_sapling, t.value_balance_orchard, t.value_balance_ironwood,
                    t.flow_type, t.privacy_score, $1, t.created_at,
-                   t.orchard_anchor, t.ironwood_anchor
+                   t.orchard_anchor, t.ironwood_anchor, t.value_balance_sprout
                FROM transactions t WHERE t.block_height >= $2
                ON CONFLICT (txid, block_hash) DO NOTHING"#
         )

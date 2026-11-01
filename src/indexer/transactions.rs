@@ -125,30 +125,26 @@ impl TransactionParser {
             });
         }
 
-        // Get shielded data
-        let (joinsplit_count, sapling_spends, sapling_outputs, orchard_actions) = match &tx {
-            V1 { .. } | V2 { .. } => (0, 0, 0, 0),
-            V3 { joinsplit_data, .. } => {
-                let js_count = joinsplit_data
-                    .as_ref()
-                    .map(|d| d.joinsplits().count())
-                    .unwrap_or(0);
-                (js_count as u16, 0, 0, 0)
-            }
+        // Sprout JoinSplits exist in v2 (BCTV14), v3 (BCTV14) and v4 (Groth16).
+        // vpub_old moves transparent value into Sprout; vpub_new moves value
+        // out of Sprout. Each amount is consensus-bounded, but sums are still
+        // checked because this is untrusted input.
+        let joinsplit_count = u16::try_from(tx.output_values_to_sprout().count())
+            .map_err(|_| format!("too many JoinSplits in {}", txid))?;
+        let sprout_value_balance = Self::sprout_value_balance(&tx)
+            .ok_or_else(|| format!("Sprout value balance overflow for {}", txid))?;
+
+        let (sapling_spends, sapling_outputs, orchard_actions) = match &tx {
+            V1 { .. } | V2 { .. } | V3 { .. } => (0, 0, 0),
             V4 {
-                joinsplit_data,
                 sapling_shielded_data,
                 ..
             } => {
-                let js_count = joinsplit_data
-                    .as_ref()
-                    .map(|d| d.joinsplits().count())
-                    .unwrap_or(0);
                 let (spends, outputs) = sapling_shielded_data
                     .as_ref()
                     .map(|d| (d.spends().count(), d.outputs().count()))
                     .unwrap_or((0, 0));
-                (js_count as u16, spends as u16, outputs as u16, 0)
+                (spends as u16, outputs as u16, 0)
             }
             V5 {
                 sapling_shielded_data,
@@ -163,7 +159,7 @@ impl TransactionParser {
                     .as_ref()
                     .map(|d| d.actions.len())
                     .unwrap_or(0);
-                (0, spends as u16, outputs as u16, actions as u16)
+                (spends as u16, outputs as u16, actions as u16)
             }
             // NU6.3 v6: Zakura exposes Orchard bundle fields directly.
             // Ironwood is counted separately below.
@@ -180,7 +176,7 @@ impl TransactionParser {
                     .as_ref()
                     .map(|d| d.actions.len())
                     .unwrap_or(0);
-                (0, spends as u16, outputs as u16, actions as u16)
+                (spends as u16, outputs as u16, actions as u16)
             }
         };
 
@@ -311,12 +307,25 @@ impl TransactionParser {
             sapling_value_balance,
             orchard_value_balance,
             ironwood_value_balance,
+            sprout_value_balance,
             orchard_anchor,
             ironwood_anchor,
             fee,
             vin,
             vout,
         })
+    }
+
+    /// Sum of Sprout `vpub_new` minus sum of `vpub_old` (positive = leaving
+    /// Sprout). Zero for versions without JoinSplits. `None` on overflow.
+    pub(crate) fn sprout_value_balance(tx: &ChainTransaction) -> Option<i64> {
+        let leaving = tx
+            .input_values_from_sprout()
+            .try_fold(0i64, |total, value| total.checked_add(i64::from(*value)))?;
+        let entering = tx
+            .output_values_to_sprout()
+            .try_fold(0i64, |total, value| total.checked_add(i64::from(*value)))?;
+        leaving.checked_sub(entering)
     }
 
     /// Parse output script to get address and type
@@ -540,18 +549,7 @@ impl TransactionParser {
                     .ok_or_else(|| format!("transparent input overflow for {}", tx.txid))
             })?;
 
-            let shielded_value_balance = tx
-                .sapling_value_balance
-                .checked_add(tx.orchard_value_balance)
-                .and_then(|value| value.checked_add(tx.ironwood_value_balance))
-                .ok_or_else(|| format!("shielded value balance overflow for {}", tx.txid))?;
-            let fee = tx
-                .transparent_value_in
-                .checked_add(shielded_value_balance)
-                .and_then(|value| value.checked_sub(tx.transparent_value_out))
-                .ok_or_else(|| format!("fee overflow for {}", tx.txid))?;
-
-            tx.fee = if fee >= 0 { Some(fee) } else { None };
+            tx.fee = tx.compute_fee()?;
         }
         Ok(())
     }
