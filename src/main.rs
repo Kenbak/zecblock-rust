@@ -259,6 +259,10 @@ enum Commands {
         /// Report counts and sample diffs without writing or checkpointing
         #[arg(long)]
         dry_run: bool,
+        /// Ignore and never write the shared resume checkpoint (parallel or
+        /// targeted range runs; writes are idempotent)
+        #[arg(long)]
+        no_resume: bool,
         /// Sample diffs to print per category
         #[arg(long, default_value = "20")]
         samples: usize,
@@ -480,6 +484,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             to,
             window,
             dry_run,
+            no_resume,
             samples,
             lock_timeout_ms,
             statement_timeout_ms,
@@ -490,6 +495,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 to,
                 window,
                 dry_run,
+                no_resume,
                 samples,
                 lock_timeout_ms,
                 statement_timeout_ms,
