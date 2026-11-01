@@ -30,6 +30,23 @@ Measured on the public mainnet dataset (2026-11-01):
 | Example: v4 `9329552a…c047` (h 500758) | stored 4,625,281,439,411 zat, true fee 10,000 |
 | Example: v4 `c0174bcd…7e1a` (h 3537885) | stored 0, true fee 20,000 |
 
+**Why heights below 347501 were never flagged.** Commit `4b87151` (2026-01-21,
+"Use zebra-chain for transaction parsing") matched `V1 { .. } | V2 { .. }` to
+zero JoinSplits. It was the first Rust parser of whole-chain history, so every
+v2 row it wrote, or that `backfill-metadata` rewrote, has `has_sprout=false`,
+`sprout_joinsplit_count=0` and `has_shielded_data=false`. Overwinter activates
+at 347500, and the first v3 transaction (whose JoinSplits were counted) is at
+347501, which is where the public dataset's first shielded transaction appears.
+
+**Independent node audit (2026-11-01, sibling session).** JoinSplits were
+confirmed in transactions stored with `has_sprout=false`, for example
+`eba96965633a…` (h150000), `fe5eff321d75…` and `c852de496bae…` (h250000), and
+`fd7020561d29…` (h300000). Sapling, Orchard and Ironwood balances and counts,
+transparent values and non-Sprout fees matched the node on 308 sampled txs in
+37 blocks plus 30 Ironwood txs. Orchard fees of 2^32+N zat (for example
+`b20ca0332fec…` at h2891527) are real on-chain overpayments that the coinbase
+claimed. This repair recomputes those from the node, so it leaves them unchanged.
+
 ## Fix
 
 - The parser sums `vpub_new - vpub_old` for v2–v4 into `sprout_value_balance`.
@@ -79,6 +96,8 @@ cipherscan-indexer repair-sprout-fees --from 0 --to <H> --window 1000
 - Dry run reports counts (tx/fee/NULL/Sprout-balance/JoinSplit/block-total/flow
   changes, the summed old−new fee delta, and anomalies) plus sample diffs.
 
+Suggested order: first a dry run and real run of `--from 0 --to 347500` (all
+v2 history, where every Sprout row is wrong), then `--from 347501 --to <tip>`.
 Run the full range up to the current tip after the new indexer binary is live,
 so every row written before the deploy is covered. Sprout stops changing at NU7
 (height 3,543,405): v4 transactions, and with them Sprout spends, are invalid
@@ -115,7 +134,29 @@ Persisted (needs action):
 4. **`metric_anomalies` `daily_fees_zat`** (upsert-only): delete the range,
    then run `node server/jobs/detect-anomalies.js --days=N` (N ≤ 3660).
 5. **`trading_signals.fee_pressure`**: `node server/signals/compute.js --backfill`.
-6. **Changed flows only**: `REFRESH MATERIALIZED VIEW CONCURRENTLY flow_daily`;
+6. **Shielded transaction counts** (`has_sprout`/`has_shielded_data` change for
+   v2 history):
+   - **`privacy_stats`** (all-time shielded/transparent/mixed/fully-shielded
+     counts and percentage): recomputed by the next
+     `server/jobs/update-privacy-stats.js` run, which counts the whole table
+     through `SHIELDED` in `server/lib/transaction-activity.js`.
+   - **`privacy_trends_daily` counts**: the job reconciles only the last 7 days.
+     For history, preview with
+     `node server/scripts/repair-activity-counts.js --start=2016-10-31 --end=<first uncovered completed day>`
+     (2016-10-31 is the `HISTORY_START` constant),
+     then add `--apply`. It rewrites counts and percentage only, never
+     balances or scores.
+   - **Historical privacy scores** stored in `privacy_trends_daily` use 30-day
+     transaction windows, so 2016–2018 scores are affected.
+     `server/scripts/backfill-privacy-trends.js --skip-rpc --exact --days=N`
+     recomputes them from stored pool columns. Check that it updates existing
+     rows the intended way before applying, because `repair-activity-counts.js`
+     deliberately leaves scores unchanged.
+   - **Ask `activity_daily.shielded_transactions`/`transparent_transactions`**:
+     replicated `has_sprout` UPDATEs mark those days dirty (item 2).
+   - **Computed per request:** `/v1/shielded-pools/activity` Sprout counts
+     (`server/api/lib/pool-activity.js`) and the bot's Sprout exclusions.
+7. **Changed flows only**: `REFRESH MATERIALIZED VIEW CONCURRENTLY flow_daily`;
    `server/jobs/refresh-turnstile.js --date=…` per affected date (or
    `--rebuild`); `server/signals/build-pool-realized-cap.js --rebuild`, then
    the MVRV rebuild.
