@@ -12,6 +12,7 @@ def load(name):
 
 role = load('create-observer-db-role')
 install = load('install-observer')
+remote = load('add-remote-node')
 PW = 'a' * 64
 
 
@@ -60,6 +61,38 @@ class ObserverKitTest(unittest.TestCase):
         self.assertNotIn('  - fail2ban', ci)
         # cloud-init ignores `home:`; a /home path breaks ProtectHome=yes in the node unit.
         self.assertIn('homedir: /var/lib/zakura', ci)
+
+    def remote_args(self, **kw):
+        import argparse
+        base = dict(instance='node1', observer='ext-op1-node1', node_ip='1.1.1.1',
+                    tls_domain='node1.example', db_role='zecblock_capture_ext_op1',
+                    rpc_user=None)
+        base.update(kw)
+        return argparse.Namespace(**base)
+
+    def test_remote_node_env_uses_mtls_and_wireguard_db(self):
+        env = remote.build_env(self.remote_args(), PW)
+        self.assertIn('ZEBRA_GRPC_URL="https://1.1.1.1:8230"', env)
+        self.assertIn('ZEBRA_RPC_URL="http://1.1.1.1:8232"', env)
+        self.assertIn('ZEBRA_GRPC_TLS_CA_FILE="/etc/cipherscan/grpc-tls/node1-server-ca.pem"', env)
+        self.assertIn('ZEBRA_GRPC_TLS_DOMAIN="node1.example"', env)
+        self.assertIn('@10.77.0.1:5432/zcash_explorer_mainnet"', env)
+        self.assertNotIn('ZEBRA_RPC_PASS', env)
+
+    def test_remote_node_rejects_bad_input(self):
+        for kw in ({'node_ip': '10.0.0.5'}, {'node_ip': '::1'}, {'observer': 'do-nyc3'},
+                   {'observer': 'local-node'}, {'instance': 'Node One'}, {'tls_domain': 'a b'}):
+            with self.assertRaises(ValueError):
+                remote.build_env(self.remote_args(**kw), PW)
+        with self.assertRaises(ValueError):
+            remote.build_env(self.remote_args(rpc_user='zec'), PW)
+
+    def test_remote_unit_is_a_template_with_its_own_journal(self):
+        unit = (HERE / 'cipherscan-remote-collector@.service').read_text()
+        self.assertIn('EnvironmentFile=/etc/cipherscan/remote/%i.env', unit)
+        self.assertIn('--journal /var/lib/cipherscan-remote-collector/%i', unit)
+        self.assertIn('User=zakura', unit)
+        self.assertNotIn('zakurad-observer.service', unit)
 
 
 if __name__ == '__main__':
