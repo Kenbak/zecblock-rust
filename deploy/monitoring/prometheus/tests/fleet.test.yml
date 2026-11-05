@@ -18,7 +18,10 @@ tests:
         exp_alerts:
           - exp_labels: {severity: critical, job: node, instance: "10.77.0.2:9100", host: do-nyc3}
             exp_annotations:
-              summary: "do-nyc3 node_exporter unreachable over WireGuard for 3m"
+              action: "Try to SSH in. If it does not answer, open the provider console (Hetzner or DigitalOcean) and check whether it is running; a reboot from there usually brings it back."
+              impact: "If this is the main server, the website and API are probably down. If it is an observer, orphan tracking just has one fewer vantage point."
+              summary: "Monitoring has not been able to reach this server for 3 minutes."
+              title: "Server not responding"
 
   - name: CVE stopgap missing is critical, drops are info
     interval: 30s
@@ -33,15 +36,19 @@ tests:
         exp_alerts:
           - exp_labels: {severity: critical, instance: "10.77.0.20:9100", host: standby}
             exp_annotations:
-              summary: "standby has no CVE-2026-98432 nft drop rule (table ip cve_2026_98432); host kernel is exposed"
-              title: "CVE-2026-98432 stopgap missing"
+              action: "Re-apply the protection now: run the observer/host hardening script again, then check with: nft list table ip cve_2026_98432."
+              impact: "Until it is back, a specially crafted network packet could crash or take over this server."
+              summary: "The firewall rule that protects this server from the CVE-2026-98432 Linux kernel bug is not in place."
+              title: "Security protection missing"
       - eval_time: 4m
         alertname: Cve202698432PacketsDropped
         exp_alerts:
           - exp_labels: {severity: info, instance: "10.77.0.1:9100", host: primary}
             exp_annotations:
-              summary: "primary dropped 5 IPv4 TCP packets with IP options in 15m"
-              title: "CVE-2026-98432 packets dropped"
+              action: "Nothing to do unless it keeps growing quickly."
+              impact: "This is the protection working. It can be random internet noise or someone probing for the kernel bug."
+              summary: "The security firewall blocked 5 unusual packets (IPv4 TCP with IP options) in 15 minutes."
+              title: "Blocked suspicious network packets"
 
   - name: stale reboot after three days
     interval: 1h
@@ -57,7 +64,10 @@ tests:
         exp_alerts:
           - exp_labels: {severity: warning, instance: "10.77.0.22:9100", host: analytics}
             exp_annotations:
-              summary: "analytics reboot pending for 3d 1h 0m 0s"
+              action: "Plan a reboot today. For the main server, check nothing important is running first."
+              impact: "Security fixes have been installed but are not protecting the server yet."
+              summary: "This server has been waiting 3d 1h 0m 0s for a restart to finish installing updates."
+              title: "Restart overdue"
 
   - name: clock offset beyond the 10 ms observer gate
     interval: 1m
@@ -72,7 +82,10 @@ tests:
         exp_alerts:
           - exp_labels: {severity: warning, instance: "10.77.0.3:9100", host: do-sgp1}
             exp_annotations:
-              summary: "do-sgp1 chrony offset 15ms (> 10 ms)"
+              action: "Check the time service: chronyc tracking. Restarting chrony usually fixes it."
+              impact: "Block first-seen times compare clocks across servers, so a wrong clock can make the wrong observer look first."
+              summary: "This server's clock is 15ms away from real time (the limit is 10 ms)."
+              title: "Server clock is off"
 
   - name: observer heartbeat, stream and no-healthy-observer
     interval: 30s
@@ -91,13 +104,19 @@ tests:
         exp_alerts:
           - exp_labels: {severity: critical, instance: "10.77.0.1:9100", host: primary, network: mainnet, observer: local-node}
             exp_annotations:
-              summary: "observer local-node (mainnet) heartbeat 9m 0s old"
+              action: "Check its collector: systemctl status cipherscan-orphan-collector (or the remote collector for partner nodes)."
+              impact: "Competing blocks it would have seen are not being recorded. The other observers keep working."
+              summary: "This observer has not checked in for 9m 0s (it normally checks in every 15 seconds)."
+              title: "Observer went quiet"
       - eval_time: 5m
         alertname: CaptureNoHealthyObserver
         exp_alerts:
           - exp_labels: {severity: critical, network: mainnet}
             exp_annotations:
-              summary: "no healthy orphan-capture observer on mainnet: competing blocks are not being captured"
+              action: "Check the main server's database and network first, then the observer collectors."
+              impact: "Competing (orphan) blocks are not being recorded at all, so orphan-rate numbers will have a gap."
+              summary: "None of our observers is working right now."
+              title: "Orphan tracking has stopped"
       - eval_time: 30s
         alertname: CaptureNoHealthyObserver
         exp_alerts: []
@@ -117,13 +136,19 @@ tests:
         exp_alerts:
           - exp_labels: {severity: critical, instance: "10.77.0.1:9100", host: primary, network: mainnet, observer: do-syd1}
             exp_annotations:
-              summary: "observer do-syd1: 2 recent canonical blocks missing from captured_blocks"
+              action: "Restart its collector and check its node is in sync."
+              impact: "Its recording is incomplete, so it may also be missing competing blocks."
+              summary: "This observer is missing 2 recent blocks that are on the main chain."
+              title: "Observer missed real blocks"
       - eval_time: 5m
         alertname: CaptureObserverJournalNearlyFull
         exp_alerts:
           - exp_labels: {severity: critical, instance: "10.77.0.1:9100", host: primary, network: mainnet, observer: do-syd1}
             exp_annotations:
-              summary: "observer do-syd1 journal 93.13% full; captures will be lost"
+              action: "Fix the observer's database connection now (WireGuard or PostgreSQL)."
+              impact: "Very soon new observations will be dropped and lost for good."
+              summary: "This observer's local backlog is 93.13% full."
+              title: "Observer about to lose data"
 
   - name: zakura tip lag and stall
     interval: 1m
@@ -140,13 +165,19 @@ tests:
         exp_alerts:
           - exp_labels: {severity: warning, host: do-nyc3, network: mainnet}
             exp_annotations:
-              summary: "do-nyc3 (mainnet) is 25 blocks behind the best fleet node"
+              action: "Usually it catches up by itself. If it lasts, check its peers and logs: journalctl -u zakurad."
+              impact: "Data from this server is late. On the main server, the site will show older blocks."
+              summary: "This node is 25 blocks behind the most up-to-date node in our fleet."
+              title: "Zcash node is behind"
       - eval_time: 55m
         alertname: ZakuraTipStalled
         exp_alerts:
           - exp_labels: {severity: critical, host: do-nyc3, network: mainnet}
             exp_annotations:
-              summary: "do-nyc3 (mainnet) tip has not advanced for 45m"
+              action: "Restart the node (systemctl restart zakurad) and watch its logs for errors."
+              impact: "The node is stuck. On the main server, the explorer stops showing new blocks."
+              summary: "This node has not received a new block for 45 minutes (normally one comes every ~75 seconds)."
+              title: "Zcash node stuck"
 
   - name: census gossip freshness per source
     interval: 1m
@@ -161,7 +192,10 @@ tests:
         exp_alerts:
           - exp_labels: {severity: warning, instance: "10.77.0.1:9100", host: primary, network: mainnet, collector_source: tor}
             exp_annotations:
-              summary: "census gossip from tor is 21m 40s old"
+              action: "Check the crawler service on that server is running."
+              impact: "The node map on the website will slowly go stale."
+              summary: "The node-map crawler has not sent new data for 21m 40s."
+              title: "Node map data is old"
 
   - name: watchdog always fires
     alert_rule_test:
@@ -189,15 +223,19 @@ tests:
         exp_alerts:
           - exp_labels: {severity: critical, instance: "10.77.0.1:9100", host: primary, reasons: "ingest_stalled,lag_exceeded"}
             exp_annotations:
-              title: "Indexer unhealthy"
-              summary: "primary indexer health check failing: ingest_stalled,lag_exceeded"
+              action: "Check its logs: journalctl -u cipherscan-indexer -n 100. A restart often fixes it."
+              impact: "New blocks and transactions may not appear on the website."
+              summary: "The indexer (which copies the blockchain into our database) is failing its health check: ingest_stalled,lag_exceeded."
+              title: "Indexer having problems"
       - eval_time: 6m
         alertname: OpsCheckFailing
         exp_alerts:
           - exp_labels: {severity: critical, instance: "10.77.0.1:9100", host: primary, check: pg_pool, name: "PostgreSQL pool"}
             exp_annotations:
+              action: "Look at the ops health output on the server for the details: journalctl -u check-ops-health -n 50."
+              impact: "Part of the website or API may be broken or slow."
+              summary: "The PostgreSQL pool check on this server is failing."
               title: "PostgreSQL pool check failing"
-              summary: "primary: PostgreSQL pool check is failing"
       - eval_time: 6m
         alertname: OpsCheckDegraded
         exp_alerts: []
@@ -206,5 +244,36 @@ tests:
         exp_alerts:
           - exp_labels: {severity: warning, instance: "10.77.0.1:9100", host: primary, check: backup, name: Backup}
             exp_annotations:
+              action: "Look at it today: journalctl -u check-ops-health -n 50 shows the reason."
+              impact: "The site still works, but a safety net (backups or replication) is not doing its job."
+              summary: "The Backup check on this server is failing."
               title: "Backup check failing"
-              summary: "primary: Backup check is failing"
+
+  - name: observer gaps alert only when recurring, not for one restart burst
+    interval: 1m
+    input_series:
+      - series: 'zecblock_capture_observer_gaps_total{network="mainnet",observer="ext-zcashpools-bhs"}'
+        values: '0x10 17x60'
+      - series: 'zecblock_capture_observer_gaps_total{network="mainnet",observer="do-sgp1"}'
+        values: '0x4 1x19 2x19 3x30'
+    alert_rule_test:
+      - eval_time: 50m
+        alertname: CaptureObserverGaps
+        exp_alerts:
+          - exp_labels: {severity: warning, network: mainnet, observer: do-sgp1}
+            exp_annotations:
+              title: "Observer keeps losing its block feed"
+              summary: "This observer's live block feed was interrupted in 3 separate 10-minute periods in the last hour."
+              impact: "It reconnects by itself each time, but while it keeps dropping it may miss competing blocks. Other observers usually cover them."
+              action: "For a zecminingpool.com node, ask its operator whether the node is restarting or overloaded. For our own observers, check the node and collector logs."
+
+  - name: ops health textfile on a 10-minute timer is not reported as stale host readings
+    interval: 1m
+    input_series:
+      - series: 'node_textfile_mtime_seconds{host="primary",file="/var/lib/prometheus/node-exporter/zecblock_ops_health.prom"}'
+        values: '0x20'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: HostTextfileStale
+        exp_alerts: []
+
