@@ -290,7 +290,8 @@ class ConsistencyTests(unittest.TestCase):
         hosts = {}
         for name in ('node', 'zakura'):
             text = (ROOT / f'prometheus/targets/{name}.yml').read_text()
-            entries = re.findall(r"targets: \['([0-9.]+):(\d+)'\]\n\s+labels: \{host: ([a-z0-9-]+),", text)
+            # Commented-out (not yet live) targets are validated too: they are the plan.
+            entries = re.findall(r"targets: \['([0-9.]+):(\d+)'\]\n#?\s+labels: \{host: ([a-z0-9-]+),", text)
             self.assertTrue(entries)
             seen = set()
             for ip, port, h in entries:
