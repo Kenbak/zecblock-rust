@@ -1,5 +1,6 @@
 //! Database module - RocksDB reading, PostgreSQL writing, and gRPC streaming
 
+pub mod capture_audit;
 pub mod grpc;
 pub mod observations;
 pub mod orphan_capture;

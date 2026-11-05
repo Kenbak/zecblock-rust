@@ -111,3 +111,33 @@ exercise slow-consumer/restart/node-session transitions, measure on-server
 memory/latency/IO under representative load, and coordinate a reviewed schema,
 API method/coverage contract and rate-source start date. Never infer complete
 network coverage from healthy transport or one observer.
+
+## Coverage audit and timed gaps (migration 042)
+
+The continuous collector (`orphan-collect`) now measures its own coverage:
+
+- **Timed gaps.** Every interval where it was not streaming (process down,
+  disconnected) is recorded with start/end/reason. `unobserved_ms` is the
+  running total since `coverage_since`; `recent_gaps` keeps the latest 32;
+  `outage_since` is set while an interval is open. Retained replay can still
+  recover blocks from these intervals, so they bound unverified time, not
+  missed blocks.
+- **Fork-tip audit.** Every `CAPTURE_AUDIT_INTERVAL_SECONDS` (default 300,
+  60–3600) a separate task asks the node for `getchaintips` and walks each
+  `valid-fork` branch through captured parent links (pending journal first,
+  then `captured_blocks`). A block missing on two consecutive audits goes into
+  `block_capture_audit_misses`; if it is delivered later it is marked
+  `captured_later_at`, never deleted.
+- **Canonical stream-drop check.** The same audit counts the last 1,000
+  settled canonical heights since collection start that are absent from
+  `captured_blocks` (`audit_canonical_missing`).
+- **Journal budget.** Pending (undelivered) bytes default to 1 GiB, about
+  3.5 hours of maximum-size blocks at 25-second spacing, configurable with
+  `CAPTURE_JOURNAL_MAX_BYTES` (64 MiB–16 GiB). The collector warns once the
+  journal passes half full and reports `pending_bytes`/`journal_max_bytes`.
+
+Limits: the audit only proves coverage relative to blocks this node validated.
+A competing block that never reached the node is invisible to both. Apply
+migration 042 before or after the binary; without it the collector keeps the
+035 contract and the audit waits. The audit uses the role's second allowed
+connection (`CONNECTION LIMIT 2`).

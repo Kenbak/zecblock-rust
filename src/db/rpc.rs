@@ -195,16 +195,25 @@ impl ZebraRpc {
         fork_tip_hashes(tips)
     }
 
+    /// All node chain tips, including heights and branch lengths.
+    pub async fn get_chain_tips(&self) -> Result<Vec<ChainTip>, String> {
+        self.call("getchaintips", vec![]).await
+    }
+
     /// Get blockchain info (includes valuePools with authoritative pool balances)
     pub async fn get_blockchain_info(&self) -> Result<serde_json::Value, String> {
         self.call("getblockchaininfo", vec![]).await
     }
 }
 
-#[derive(Deserialize)]
-struct ChainTip {
-    hash: String,
-    status: String,
+#[derive(Clone, Debug, Deserialize)]
+pub struct ChainTip {
+    pub hash: String,
+    pub status: String,
+    #[serde(default)]
+    pub height: u64,
+    #[serde(default)]
+    pub branchlen: u64,
 }
 
 fn fork_tip_hashes(tips: Vec<ChainTip>) -> Result<Vec<Vec<u8>>, String> {
@@ -245,13 +254,17 @@ mod fork_tip_tests {
     fn refuses_malformed_or_excessive_fork_tips() {
         assert!(fork_tip_hashes(vec![ChainTip {
             hash: "00".repeat(31),
-            status: "valid-fork".into()
+            status: "valid-fork".into(),
+            height: 0,
+            branchlen: 0,
         }])
         .is_err());
         let tips = (0..zakura_chain::parameters::MAX_NON_FINALIZED_CHAIN_FORKS)
             .map(|i| ChainTip {
                 hash: hex::encode([i as u8; 32]),
                 status: "valid-fork".into(),
+                height: 0,
+                branchlen: 0,
             })
             .collect();
         assert!(fork_tip_hashes(tips).is_err());

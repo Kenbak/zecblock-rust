@@ -1,4 +1,4 @@
-"""Run on the serving host after migration 035 and artifact verification. Never prints secrets."""
+"""Run on the serving host after migrations 035 (and 042 for the coverage audit) and artifact verification. Never prints secrets."""
 import os, pathlib, secrets, subprocess, sys
 network, artifact, expected = sys.argv[1:]
 assert network in ('mainnet','testnet')
@@ -34,6 +34,7 @@ GRANT CONNECT ON DATABASE {db} TO zecblock_capture;
 GRANT USAGE ON SCHEMA public TO zecblock_capture;
 GRANT SELECT ON blocks TO zecblock_capture;
 GRANT SELECT, INSERT, UPDATE ON captured_blocks, block_capture_observers, block_capture_receipts TO zecblock_capture;
+DO $$ BEGIN IF to_regclass('public.block_capture_audit_misses') IS NOT NULL THEN GRANT SELECT, INSERT, UPDATE ON block_capture_audit_misses TO zecblock_capture; END IF; END $$;
 ALTER ROLE zecblock_capture SET statement_timeout='3s';
 ALTER ROLE zecblock_capture SET lock_timeout='500ms';
 """
