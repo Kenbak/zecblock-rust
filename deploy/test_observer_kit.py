@@ -78,6 +78,10 @@ class ObserverKitTest(unittest.TestCase):
         self.assertIn('ZEBRA_GRPC_TLS_DOMAIN="node1.example"', env)
         self.assertIn('@10.77.0.1:5432/zcash_explorer_mainnet"', env)
         self.assertNotIn('ZEBRA_RPC_PASS', env)
+        self.assertNotIn('ZEBRA_RPC_TLS_CA_FILE', env)
+        tls = remote.build_env(self.remote_args(rpc_https=True), PW)
+        self.assertIn('ZEBRA_RPC_URL="https://1.1.1.1:8232"', tls)
+        self.assertIn('ZEBRA_RPC_TLS_CA_FILE="/etc/cipherscan/grpc-tls/node1-server-ca.pem"', tls)
 
     def test_remote_node_rejects_bad_input(self):
         for kw in ({'node_ip': '10.0.0.5'}, {'node_ip': '::1'}, {'observer': 'do-nyc3'},

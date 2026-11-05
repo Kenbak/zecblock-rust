@@ -46,7 +46,7 @@ def build_env(a, db_password, rpc_password=None, server_ca_path=None):
     env = {
         'NETWORK': 'mainnet',
         'OBSERVER': a.observer,
-        'ZEBRA_RPC_URL': f'http://{ip}:8232',
+        'ZEBRA_RPC_URL': f'{"https" if getattr(a, "rpc_https", False) else "http"}://{ip}:8232',
         'ZEBRA_GRPC_URL': f'https://{ip}:8230',
         'ZEBRA_GRPC_TLS_CA_FILE': str(server_ca_path or TLS_DIR / f'{a.instance}-server-ca.pem'),
         'ZEBRA_GRPC_TLS_CERT_FILE': str(TLS_DIR / 'client.pem'),
@@ -54,6 +54,8 @@ def build_env(a, db_password, rpc_password=None, server_ca_path=None):
         'ZEBRA_GRPC_TLS_DOMAIN': a.tls_domain,
         'DATABASE_URL': f'postgresql://{a.db_role}:{db_password}@{HUB}:5432/zcash_explorer_mainnet',
     }
+    if getattr(a, 'rpc_https', False):
+        env['ZEBRA_RPC_TLS_CA_FILE'] = env['ZEBRA_GRPC_TLS_CA_FILE']
     if a.rpc_user:
         if rpc_password is None:
             raise ValueError('--rpc-user needs --rpc-password-file')
@@ -66,6 +68,7 @@ def main(argv):
     p = argparse.ArgumentParser()
     for flag in ('--instance', '--observer', '--node-ip', '--server-ca', '--tls-domain', '--db-role', '--db-password-file'):
         p.add_argument(flag, required=True)
+    p.add_argument('--rpc-https', action='store_true', help='node serves JSON-RPC over TLS signed by --server-ca')
     p.add_argument('--rpc-user')
     p.add_argument('--rpc-password-file')
     a = p.parse_args(argv)
