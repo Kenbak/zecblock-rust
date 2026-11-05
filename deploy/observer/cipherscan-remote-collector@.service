@@ -1,0 +1,41 @@
+[Unit]
+Description=ZecBlock remote-node competing-block collector (%i)
+# Collects from a third-party Zakura node over mutual TLS; the local node is not involved.
+After=network-online.target wg-quick@wg0.service
+Requires=wg-quick@wg0.service
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+# zakura can read /etc/cipherscan/grpc-tls (0750 root:zakura) and owns nothing else here.
+User=zakura
+Group=zakura
+WorkingDirectory=/var/lib/cipherscan-remote-collector/%i
+EnvironmentFile=/etc/cipherscan/remote/%i.env
+Environment=TOKIO_WORKER_THREADS=2
+ExecStart=/opt/cipherscan-remote-collector/cipherscan-indexer orphan-collect --journal /var/lib/cipherscan-remote-collector/%i --observer ${OBSERVER}
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=15
+StateDirectory=cipherscan-remote-collector/%i
+StateDirectoryMode=0700
+UMask=0077
+MemoryMax=192M
+MemorySwapMax=0
+CPUQuota=25%
+IOWeight=10
+Nice=10
+TasksMax=32
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target
