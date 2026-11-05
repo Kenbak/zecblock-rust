@@ -20,6 +20,29 @@ class MigrationLintTests(unittest.TestCase):
         for sql in ['CREATE INDEX x_idx ON x(id);', 'CREATE UNIQUE INDEX "CONCURRENTLY" ON x(id);']:
             self.assertTrue(module.lint(sql)[0])
 
+    def test_index_on_table_created_in_same_transaction_is_allowed(self):
+        for sql in [
+            "BEGIN; CREATE TABLE IF NOT EXISTS x (id int); CREATE INDEX IF NOT EXISTS x_idx ON x(id); COMMIT;",
+            "BEGIN; CREATE TABLE x (id int); CREATE UNIQUE INDEX x_idx ON ONLY x USING btree (id); COMMIT;",
+            "BEGIN; CREATE TABLE public.x (id int); CREATE INDEX x_idx ON PUBLIC.X(id); COMMIT;",
+        ]:
+            with self.subTest(sql=sql):
+                self.assertEqual(module.lint(sql)[0], [])
+
+    def test_index_on_table_not_created_in_the_open_transaction_is_rejected(self):
+        for sql in [
+            "BEGIN; CREATE TABLE x (id int); CREATE INDEX y_idx ON y(id); COMMIT;",
+            "BEGIN; CREATE TABLE x (id int); COMMIT; CREATE INDEX x_idx ON x(id);",
+            "BEGIN; CREATE TABLE x (id int); COMMIT; BEGIN; CREATE INDEX x_idx ON x(id); COMMIT;",
+            "CREATE TABLE x (id int); CREATE INDEX x_idx ON x(id);",
+            "BEGIN; CREATE TABLE x (id int); ROLLBACK; BEGIN; CREATE INDEX x_idx ON x(id); COMMIT;",
+            'BEGIN; CREATE TABLE "x" (id int); CREATE INDEX x_idx ON "x"(id); COMMIT;',
+            "BEGIN; CREATE TABLE x AS SELECT 1 AS id; CREATE INDEX x_idx ON x(id); COMMIT;",
+            "BEGIN; CREATE TABLE x (id int); CREATE INDEX x_idx ON public.x(id); COMMIT;",
+        ]:
+            with self.subTest(sql=sql):
+                self.assertTrue(module.lint(sql)[0])
+
     def test_comments_and_quoted_function_bodies_are_not_transactions(self):
         sql = """-- BEGIN; CREATE INDEX x ON y(id);
         /* BEGIN; /* nested */ COMMIT; */
