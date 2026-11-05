@@ -1,0 +1,22 @@
+[Unit]
+Description=ZecBlock host security/clock textfile metrics (CVE-2026-98432 nft, reboot, chrony)
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /opt/zecblock-monitor/bin/zecblock-host-textfile.py --dir /var/lib/prometheus/node-exporter
+TimeoutStartSec=30
+Nice=10
+IOSchedulingClass=idle
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/var/lib/prometheus/node-exporter
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+# nft needs netlink + CAP_NET_ADMIN to read the ruleset; chronyc uses its Unix socket.
+RestrictAddressFamilies=AF_UNIX AF_NETLINK AF_INET AF_INET6
+CapabilityBoundingSet=CAP_NET_ADMIN

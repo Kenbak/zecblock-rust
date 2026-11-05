@@ -1,0 +1,30 @@
+# /etc/wireguard/wg0.conf on the MONITOR (10.77.0.2). Example only: copy, then
+# fill keys and endpoints on the host. Never commit the filled file.
+#
+# The monitor peers directly with every host (no hub), so monitoring keeps
+# working when the primary (the observers' PostgreSQL hub) is down.
+# AllowedIPs are /32 per host: the monitor can reach only each host's own wg
+# address, and hosts cannot route through the monitor.
+[Interface]
+Address = 10.77.0.2/24
+ListenPort = 51820
+PostUp = wg set %i private-key /etc/wireguard/monitor.key
+
+# One block per host. Endpoint = host public address:51820 (from the wiki host
+# table, not from this repo). PersistentKeepalive keeps NAT/conntrack open.
+[Peer]
+# primary
+PublicKey = <primary wg public key>
+AllowedIPs = 10.77.0.1/32
+Endpoint = <primary public address>:51820
+PersistentKeepalive = 25
+
+[Peer]
+# do-nyc3 observer
+PublicKey = <do-nyc3 wg public key>
+AllowedIPs = 10.77.0.11/32
+Endpoint = <do-nyc3 public address>:51820
+PersistentKeepalive = 25
+
+# ... standby 10.77.0.3, testnet .4, analytics .5, crosslink .6,
+# cipherpay-mainnet .7, cipherpay-testnet .8, shopify .9, do-sgp1 .12, do-syd1 .13

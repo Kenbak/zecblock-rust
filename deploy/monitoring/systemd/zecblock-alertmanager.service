@@ -1,0 +1,41 @@
+[Unit]
+Description=ZecBlock fleet Alertmanager (loopback only, Telegram receiver)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=zecblock-alertmanager
+Group=zecblock-alertmanager
+RuntimeDirectory=zecblock-alertmanager
+RuntimeDirectoryMode=0700
+StateDirectory=zecblock-alertmanager
+StateDirectoryMode=0700
+UMask=0077
+# Renders the config from the committed template plus /etc/zecblock-monitor secrets.
+ExecStartPre=/usr/bin/python3 /opt/zecblock-monitor/bin/render-alertmanager.py \
+  --template /etc/zecblock-monitor/alertmanager/alertmanager.yml.tmpl \
+  --secrets-dir /etc/zecblock-monitor \
+  --templates-dir /etc/zecblock-monitor/alertmanager \
+  --out /run/zecblock-alertmanager/alertmanager.yml
+ExecStartPre=/opt/zecblock-monitor/alertmanager/amtool check-config /run/zecblock-alertmanager/alertmanager.yml
+ExecStart=/opt/zecblock-monitor/alertmanager/alertmanager \
+  --config.file=/run/zecblock-alertmanager/alertmanager.yml \
+  --storage.path=/var/lib/zecblock-alertmanager \
+  --web.listen-address=127.0.0.1:9093 \
+  --cluster.listen-address=
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+CapabilityBoundingSet=
+
+[Install]
+WantedBy=multi-user.target

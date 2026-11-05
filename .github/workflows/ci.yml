@@ -71,6 +71,11 @@ jobs:
           printf '%s\n' "$output"
           grep -q 'All migrations already applied' <<< "$output"
 
+      - name: Run the monitoring exporter SQL against the migrated database
+        env:
+          MONITOR_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/cipherscan_ci
+        run: python3 -m unittest discover -s deploy -p 'test_monitoring_sql.py' -v
+
       - name: Reproduce and verify subsidy cache default-ACL repair
         env:
           MIGRATION_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/cipherscan_ci
@@ -91,3 +96,29 @@ jobs:
           path: target/release/cipherscan-indexer
           if-no-files-found: error
           retention-days: 7
+
+  monitoring:
+    name: monitoring configs (promtool + amtool)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fetch pinned promtool and amtool (SHA-256 verified)
+        run: |
+          set -euo pipefail
+          source deploy/monitoring/versions.env
+          mkdir -p "$RUNNER_TEMP/tools" && cd "$RUNNER_TEMP/tools"
+          curl -fsSLo prometheus.tar.gz "$PROMETHEUS_URL"
+          curl -fsSLo alertmanager.tar.gz "$ALERTMANAGER_URL"
+          echo "$PROMETHEUS_SHA256  prometheus.tar.gz" | sha256sum -c -
+          echo "$ALERTMANAGER_SHA256  alertmanager.tar.gz" | sha256sum -c -
+          tar xzf prometheus.tar.gz --strip-components=1 --wildcards '*/promtool'
+          tar xzf alertmanager.tar.gz --strip-components=1 --wildcards '*/amtool'
+          ./promtool --version
+          ./amtool --version
+      - name: Validate Prometheus, rules, rule unit tests, Alertmanager and dashboard
+        env:
+          PROMTOOL: ${{ runner.temp }}/tools/promtool
+          AMTOOL: ${{ runner.temp }}/tools/amtool
+        run: bash deploy/monitoring/validate.sh
+      - name: Monitoring unit tests
+        run: python3 -m unittest deploy/test_monitoring.py -v

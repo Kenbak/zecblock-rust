@@ -1,0 +1,35 @@
+[Unit]
+Description=ZecBlock fleet Prometheus (loopback only)
+After=network-online.target wg-quick@wg0.service
+Wants=network-online.target
+
+[Service]
+User=zecblock-prometheus
+Group=zecblock-prometheus
+ExecStart=/opt/zecblock-monitor/prometheus/prometheus \
+  --config.file=/etc/zecblock-monitor/prometheus/prometheus.yml \
+  --storage.tsdb.path=/var/lib/zecblock-prometheus \
+  --storage.tsdb.retention.time=90d \
+  --storage.tsdb.retention.size=30GB \
+  --web.listen-address=127.0.0.1:9090
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=5
+StateDirectory=zecblock-prometheus
+StateDirectoryMode=0700
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+CapabilityBoundingSet=
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,25 @@
+# Grafana datasource provisioning. Both point at loopback services on the monitor.
+# No PostgreSQL datasource on purpose: the monitor never holds database credentials;
+# database-derived health arrives as aggregates from zecblock-capture-exporter.py.
+apiVersion: 1
+deleteDatasources: []
+datasources:
+  - name: Prometheus
+    uid: zecblock-prometheus
+    type: prometheus
+    access: proxy
+    url: http://127.0.0.1:9090
+    isDefault: true
+    editable: false
+    jsonData:
+      timeInterval: 30s
+      httpMethod: POST
+  - name: Alertmanager
+    uid: zecblock-alertmanager
+    type: alertmanager
+    access: proxy
+    url: http://127.0.0.1:9093
+    editable: false
+    jsonData:
+      implementation: prometheus
+      handleGrafanaManagedAlerts: false

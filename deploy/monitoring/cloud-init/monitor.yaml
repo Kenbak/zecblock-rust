@@ -1,0 +1,90 @@
+#cloud-config
+# ZecBlock fleet monitor droplet base image (Ubuntu 24.04). Contains no secrets:
+# the WireGuard key is generated on the host; Telegram/Grafana secrets arrive
+# later over SSH (README "Secrets"). Same security baseline as the observers
+# (wiki architecture/cipherscan-security.md, 2026-11-05):
+# - CVE-2026-98432 stopgap: drop IPv4 TCP carrying IP options at raw
+#   prerouting, plus MPTCP disabled, until Ubuntu ships the fixed kernel to
+#   -security; unattended upgrades reboot automatically at 04:00 UTC to pick it up.
+# - No Fail2ban (CVE-2026-109786 in its SSH filter); key-only SSH, UFW rate limit.
+# - Prometheus, Alertmanager, Grafana and node_exporter listen on loopback only.
+#   Nothing but SSH (22/tcp, limited) and WireGuard (51820/udp) is reachable.
+#   WireGuard drops unauthenticated packets, so 51820/udp is not restricted by
+#   source address (the fleet's public addresses are not kept in this public repo).
+package_update: true
+package_upgrade: true
+package_reboot_if_required: true
+packages:
+  - chrony
+  - wireguard
+  - ufw
+  - nftables
+  - unattended-upgrades
+  - prometheus-node-exporter
+  - python3
+users:
+  - default
+write_files:
+  - path: /etc/ssh/sshd_config.d/10-monitor.conf
+    content: |
+      PasswordAuthentication no
+      KbdInteractiveAuthentication no
+      PermitRootLogin prohibit-password
+      MaxAuthTries 3
+      LoginGraceTime 20
+      AllowTcpForwarding local
+      X11Forwarding no
+  - path: /etc/sysctl.d/99-disable-mptcp.conf
+    content: |
+      net.mptcp.enabled = 0
+  - path: /etc/nftables.d/cve-2026-98432.nft
+    content: |
+      table ip cve_2026_98432 {
+        chain prerouting {
+          type filter hook prerouting priority raw; policy accept;
+          meta l4proto tcp ip hdrlength != 5 counter drop
+        }
+      }
+  - path: /etc/systemd/system/cve-2026-98432-nft.service
+    content: |
+      [Unit]
+      Description=Drop IPv4 TCP with IP options (CVE-2026-98432 stopgap)
+      DefaultDependencies=no
+      Before=network-pre.target
+      Wants=network-pre.target
+
+      [Service]
+      Type=oneshot
+      RemainAfterExit=yes
+      ExecStart=/usr/sbin/nft -f /etc/nftables.d/cve-2026-98432.nft
+      ExecStop=/usr/sbin/nft delete table ip cve_2026_98432
+
+      [Install]
+      WantedBy=multi-user.target
+  - path: /etc/default/prometheus-node-exporter
+    content: |
+      ARGS="--web.listen-address=127.0.0.1:9100 --collector.textfile.directory=/var/lib/prometheus/node-exporter"
+  - path: /etc/apt/apt.conf.d/20auto-upgrades
+    content: |
+      APT::Periodic::Update-Package-Lists "1";
+      APT::Periodic::Unattended-Upgrade "1";
+  - path: /etc/apt/apt.conf.d/52monitor-upgrades
+    # A short monitoring gap at 04:00 UTC is recorded by Watchdog; an unpatched kernel is not acceptable.
+    content: |
+      Unattended-Upgrade::Automatic-Reboot "true";
+      Unattended-Upgrade::Automatic-Reboot-Time "04:00";
+runcmd:
+  - [timedatectl, set-timezone, UTC]
+  - [systemctl, daemon-reload]
+  - [systemctl, enable, --now, cve-2026-98432-nft.service]
+  - [sysctl, --system]
+  - [systemctl, restart, ssh]
+  - [systemctl, enable, --now, chrony]
+  - [systemctl, restart, prometheus-node-exporter]
+  - [install, -d, -m, "0755", /etc/zecblock-monitor, /opt/zecblock-monitor]
+  - [sh, -c, "umask 077 && wg genkey | tee /etc/wireguard/monitor.key | wg pubkey > /etc/wireguard/monitor.pub"]
+  - [ufw, default, deny, incoming]
+  - [ufw, default, allow, outgoing]
+  - [ufw, limit, "22/tcp"]
+  - [ufw, allow, "51820/udp"]
+  - [ufw, --force, enable]

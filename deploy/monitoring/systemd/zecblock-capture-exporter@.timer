@@ -1,0 +1,10 @@
+[Unit]
+Description=Refresh ZecBlock capture/census metrics for %i every 30 s
+
+[Timer]
+OnBootSec=60s
+OnUnitActiveSec=30s
+AccuracySec=2s
+
+[Install]
+WantedBy=timers.target
