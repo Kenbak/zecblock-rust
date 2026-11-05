@@ -11,6 +11,8 @@
 //! - `ZEBRA_GRPC_TLS_DOMAIN` (optional): name to verify in the server
 //!   certificate when it differs from the URL host (e.g. connecting by IP).
 //!
+//! JSON-RPC behind TLS uses `ZEBRA_RPC_TLS_CA_FILE` (see `db/rpc.rs`).
+//!
 //! Plain `http://` URLs keep the existing loopback behaviour. Mixing them is
 //! refused: TLS settings with an `http://` URL, or `https://` without all three
 //! files, are configuration errors rather than silent downgrades.
