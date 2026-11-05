@@ -84,6 +84,7 @@ groups:
         expr: increase(node_vmstat_oom_kill[30m]) > 0
         labels: {severity: warning}
         annotations:
+          title: "OOM kill"
           summary: "{{ $labels.host }} kernel OOM-killed a process in the last 30m"
 
   - name: zecblock-security
@@ -93,18 +94,21 @@ groups:
         for: 2m
         labels: {severity: critical}
         annotations:
+          title: "CVE-2026-98432 stopgap missing"
           summary: "{{ $labels.host }} has no CVE-2026-98432 nft drop rule (table ip cve_2026_98432); host kernel is exposed"
       - alert: MptcpEnabled
         expr: zecblock_mptcp_enabled == 1
         for: 2m
         labels: {severity: critical}
         annotations:
+          title: "MPTCP enabled"
           summary: "{{ $labels.host }} has net.mptcp.enabled=1"
       - alert: Cve202698432PacketsDropped
         # Signal only: IPv4 TCP with IP options is rare in legitimate traffic.
         expr: increase(zecblock_cve_2026_98432_nft_dropped_packets_total[15m]) > 0
         labels: {severity: info}
         annotations:
+          title: "CVE-2026-98432 packets dropped"
           summary: "{{ $labels.host }} dropped {{ $value | printf \"%.0f\" }} IPv4 TCP packets with IP options in 15m"
       - alert: RebootPending
         expr: zecblock_reboot_required == 1 or zecblock_kernel_newer_installed == 1
