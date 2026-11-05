@@ -32,7 +32,7 @@ def build_env(network, observer, password):
         'OBSERVER': observer,
         'ZEBRA_RPC_URL': 'http://127.0.0.1:8232',
         'ZEBRA_GRPC_URL': 'http://127.0.0.1:8230',
-        'ZEBRA_RPC_COOKIE_FILE': '/var/lib/zakura/.cookie',
+        'ZEBRA_RPC_COOKIE_FILE': '/var/lib/zakura/.cache/zakura/.cookie',
         'DATABASE_URL': f'postgresql://{role}:{password}@{HUB}:5432/zcash_explorer_{network}',
     }
     return ''.join(k + '=' + quote(v) + '\n' for k, v in env.items())

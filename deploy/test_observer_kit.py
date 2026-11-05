@@ -57,6 +57,8 @@ class ObserverKitTest(unittest.TestCase):
         self.assertIn('Automatic-Reboot "true"', ci)
         self.assertIn('package_reboot_if_required: true', ci)
         self.assertNotIn('  - fail2ban', ci)
+        # cloud-init ignores `home:`; a /home path breaks ProtectHome=yes in the node unit.
+        self.assertIn('homedir: /var/lib/zakura', ci)
 
 
 if __name__ == '__main__':
