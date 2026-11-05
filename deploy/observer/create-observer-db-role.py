@@ -2,7 +2,8 @@
 
 Usage: create-observer-db-role.py <network> <observer> <wireguard-ip>
 
-Grants match deploy/install-orphan-collector.py. The password is written to a
+Grants mirror the primary's zecblock_capture login as measured 2026-11-05
+(including migration 042's block_capture_audit_misses). The password is written to a
 0600 file, never printed; move it to the observer over SSH and delete it here.
 The pg_hba line is printed for review; this script does not edit pg_hba.conf.
 """
@@ -30,8 +31,8 @@ def role_sql(role, db, password):
 ALTER ROLE {role} WITH PASSWORD '{password}' NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION CONNECTION LIMIT 2;
 GRANT CONNECT ON DATABASE {db} TO {role};
 GRANT USAGE ON SCHEMA public TO {role};
-GRANT SELECT ON blocks TO {role};
-GRANT SELECT, INSERT, UPDATE ON captured_blocks, block_capture_observers, block_capture_receipts TO {role};
+GRANT SELECT ON blocks, block_subsidy_allocations TO {role};
+GRANT SELECT, INSERT, UPDATE ON captured_blocks, block_capture_observers, block_capture_receipts, block_capture_audit_misses TO {role};
 ALTER ROLE {role} SET statement_timeout='5s';
 ALTER ROLE {role} SET lock_timeout='500ms';
 """

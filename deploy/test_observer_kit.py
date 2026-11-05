@@ -31,7 +31,7 @@ class ObserverKitTest(unittest.TestCase):
     def test_sql_grants_only_capture_tables(self):
         sql = role.role_sql('zecblock_capture_do_nyc3', 'zcash_explorer_mainnet', PW)
         self.assertIn('NOSUPERUSER', sql)
-        self.assertIn('ON captured_blocks, block_capture_observers, block_capture_receipts', sql)
+        self.assertIn('ON captured_blocks, block_capture_observers, block_capture_receipts, block_capture_audit_misses', sql)
         self.assertNotIn('transactions', sql)
 
     def test_env_points_at_wireguard_hub_and_loopback_node(self):
@@ -46,6 +46,7 @@ class ObserverKitTest(unittest.TestCase):
         unit = (HERE / 'cipherscan-observer-collector.service').read_text()
         self.assertIn('--observer ${OBSERVER}', unit)
         self.assertIn('Requires=wg-quick@wg0.service', unit)
+        self.assertIn('User=zakura', unit)
 
     def test_cloud_init_security_baseline(self):
         ci = (HERE / 'cloud-init.yaml').read_text()

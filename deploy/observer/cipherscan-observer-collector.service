@@ -7,6 +7,10 @@ StartLimitIntervalSec=0
 
 [Service]
 Type=simple
+# Runs as the node user: it must read zakurad's 0600 RPC cookie, and the
+# empty CapabilityBoundingSet would stop root from reading another user's files.
+User=zakura
+Group=zakura
 WorkingDirectory=/var/lib/cipherscan-orphan-collector
 EnvironmentFile=/etc/cipherscan/orphan-collector.env
 Environment=TOKIO_WORKER_THREADS=2
