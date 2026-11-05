@@ -44,7 +44,8 @@ observer (wg 10.77.0.N) ──WireGuard UDP 51820──▶ primary (wg 10.77.0.1
                                                      scram-sha-256, from its /32 only
 ```
 
-Public firewall on observers: 22/tcp from the admin allowlist only, 8233/tcp
+Public firewall on observers: 22/tcp key-only behind fail2ban (narrow to an
+admin allowlist after setup), 8233/tcp
 open (Zcash P2P), 51820/udp from the primary only. Everything else denied.
 RPC, gRPC and metrics are never public.
 
