@@ -9,8 +9,8 @@
 #
 # Labels: host = stable fleet name (never reused), role, provider, region.
 # No public IPs here: instance is the WireGuard address.
-#- targets: ['10.77.0.1:9100']
-#  labels: {host: primary, role: mainnet-primary, provider: hetzner, region: hel1}
+- targets: ['10.77.0.1:9100']
+  labels: {host: primary, role: mainnet-primary, provider: hetzner, region: hel1}
 #- targets: ['10.77.0.20:9100']
 #  labels: {host: standby, role: mainnet-standby, provider: hetzner, region: hel1}
 #- targets: ['10.77.0.21:9100']
