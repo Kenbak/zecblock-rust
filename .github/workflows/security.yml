@@ -7,12 +7,18 @@ on:
   schedule:
     - cron: '0 6 * * 1'
   workflow_dispatch:
+# Cancel superseded PR runs only; every main push and scheduled scan finishes.
+concurrency:
+  group: security-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 permissions:
   contents: read
 jobs:
   cargo-audit:
     name: Dependency security
     runs-on: ubuntu-24.04
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.97.1
@@ -25,6 +31,7 @@ jobs:
   secret-scan:
     name: Secret scan
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
         with:
@@ -35,5 +42,13 @@ jobs:
           curl --fail --silent --show-error --location https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz -o /tmp/gitleaks.tar.gz
           echo "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb  /tmp/gitleaks.tar.gz" | sha256sum --check
           tar -xzf /tmp/gitleaks.tar.gz -C /tmp gitleaks
-          /tmp/gitleaks git . --log-opts="--all" --redact=100 --no-banner
+          # A pull request is judged on the history it would merge, with its own
+          # .gitleaksignore; other branches' findings must not fail it. Pushes,
+          # the weekly schedule and manual runs still scan all refs.
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            log_opts="HEAD"
+          else
+            log_opts="--all"
+          fi
+          /tmp/gitleaks git . --log-opts="$log_opts" --redact=100 --no-banner
 
