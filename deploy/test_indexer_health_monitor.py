@@ -15,6 +15,38 @@ MODULE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(MODULE)
 
 
+MSPEC = importlib.util.spec_from_file_location("metrics", DEPLOY / "health-alert-metrics.py")
+METRICS = importlib.util.module_from_spec(MSPEC)
+MSPEC.loader.exec_module(METRICS)
+
+
+class MetricsTests(unittest.TestCase):
+    def failing(self, *codes):
+        return "trace\n" + json.dumps({"healthy": False, "reason_codes": list(codes), "status": {"height": 9}})
+
+    def test_healthy_and_failing_render_only_categories(self):
+        ok = METRICS.render("active", 0, 1700000000, "{}")
+        self.assertIn('zecblock_indexer_healthy{reasons=""} 1', ok)
+        self.assertIn("zecblock_indexer_service_active 1", ok)
+        self.assertIn("zecblock_indexer_health_last_run_timestamp_seconds 1700000000", ok)
+        bad = METRICS.render("active", 1, 1700000000, self.failing("lag_exceeded", "ingest_stalled", "lag_exceeded"))
+        self.assertIn('zecblock_indexer_healthy{reasons="ingest_stalled,lag_exceeded"} 0', bad)
+        self.assertNotIn("height", bad)
+
+    def test_inactive_timeout_and_unparseable(self):
+        self.assertEqual(METRICS.reasons("failed", 1, ""), ["service_inactive"])
+        self.assertEqual(METRICS.reasons("active", 124, ""), ["health_command_timeout"])
+        self.assertEqual(METRICS.reasons("active", 1, "DB down"), ["health_command_failed"])
+        # Codes that could break label syntax or leak text are not trusted.
+        self.assertEqual(METRICS.reasons("active", 1, self.failing('x"} 1\nevil')), ["health_command_failed"])
+
+    def test_script_can_run_without_telegram_and_writes_metrics(self):
+        script = (DEPLOY / "check-indexer-health.sh").read_text()
+        self.assertIn('TELEGRAM_ALERTS="${INDEXER_TELEGRAM_ALERTS:-on}"', script)
+        self.assertIn('[[ "${TELEGRAM_ALERTS}" == "on" ]] || return 0', script)
+        self.assertIn("write_metrics", script)
+
+
 class FingerprintTests(unittest.TestCase):
     def assessment(self, age, code="ingest_stalled"):
         return "trace message\n" + json.dumps({"healthy": False, "reasons": [f"age {age}s"],
