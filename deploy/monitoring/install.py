@@ -32,7 +32,7 @@ import urllib.request
 
 HERE = pathlib.Path(__file__).resolve().parent
 WG_NET = ipaddress.ip_network('10.77.0.0/24')
-MONITOR_WG = ipaddress.ip_address('10.77.0.2')
+MONITOR_WG = ipaddress.ip_address('10.77.0.10')
 OPT = pathlib.Path('/opt/zecblock-monitor')
 ETC = pathlib.Path('/etc/zecblock-monitor')
 TEXTFILE_DIR = '/var/lib/prometheus/node-exporter'
@@ -78,7 +78,7 @@ def validate_wg_ip(value):
     if ip not in WG_NET or ip == WG_NET.network_address or ip == WG_NET.broadcast_address:
         raise ValueError(f'{value} is not a host address in {WG_NET}')
     if ip == MONITOR_WG:
-        raise ValueError('10.77.0.2 is the monitor itself; use `install.py monitor`')
+        raise ValueError('10.77.0.10 is the monitor itself; use `install.py monitor`')
     return str(ip)
 
 

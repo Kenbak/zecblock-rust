@@ -216,14 +216,14 @@ class AlertmanagerRenderTests(unittest.TestCase):
 
 class InstallerTests(unittest.TestCase):
     def test_wg_ip_validation(self):
-        self.assertEqual(install.validate_wg_ip('10.77.0.11'), '10.77.0.11')
-        for bad in ('10.77.1.5', '10.77.0.0', '10.77.0.255', '10.77.0.2', '0.0.0.0'):
+        self.assertEqual(install.validate_wg_ip('10.77.0.2'), '10.77.0.2')
+        for bad in ('10.77.1.5', '10.77.0.0', '10.77.0.255', '10.77.0.10', '0.0.0.0'):
             with self.assertRaises(ValueError):
                 install.validate_wg_ip(bad)
 
     def test_node_exporter_never_binds_wildcard(self):
-        args = install.node_exporter_args('10.77.0.3:9100')
-        self.assertIn('--web.listen-address=10.77.0.3:9100', args)
+        args = install.node_exporter_args('10.77.0.20:9100')
+        self.assertIn('--web.listen-address=10.77.0.20:9100', args)
         self.assertNotIn('0.0.0.0', args)
 
     def test_versions_are_pinned(self):
@@ -234,9 +234,9 @@ class InstallerTests(unittest.TestCase):
             self.assertIn(v[f'{key}_VERSION'], v[f'{key}_URL'])
 
     def test_dry_run_monitor_does_not_need_root(self):
-        out = subprocess.run(['python3', str(ROOT / 'install.py'), 'host', '--wg-ip', '10.77.0.11', '--dry-run'],
+        out = subprocess.run(['python3', str(ROOT / 'install.py'), 'host', '--wg-ip', '10.77.0.2', '--dry-run'],
                              capture_output=True, text=True, check=True).stdout
-        self.assertIn('ufw allow in on wg0 from 10.77.0.2 to 10.77.0.11 port 9100', out)
+        self.assertIn('ufw allow in on wg0 from 10.77.0.10 to 10.77.0.2 port 9100', out)
 
 
 def kit_files():
@@ -295,7 +295,7 @@ class ConsistencyTests(unittest.TestCase):
             seen = set()
             for ip, port, h in entries:
                 self.assertIn(ipaddress.ip_address(ip), net)
-                self.assertNotEqual(ip, '10.77.0.2')
+                self.assertNotEqual(ip, '10.77.0.10')
                 self.assertNotIn(h, seen)
                 seen.add(h)
                 hosts.setdefault(h, set()).add(ip)

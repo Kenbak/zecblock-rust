@@ -8,10 +8,10 @@
 # Observers already have wg0 with the primary peer; only add the block below.
 #
 # The monitor may reach only this host's own wg address; UFW then allows
-# 9100/tcp (and 9999/tcp for Zakura, once verified) only from 10.77.0.2 on wg0.
+# 9100/tcp (and 9999/tcp for Zakura, once verified) only from 10.77.0.10 on wg0.
 [Peer]
 # zecblock monitor
 PublicKey = <monitor wg public key from /etc/wireguard/monitor.pub>
-AllowedIPs = 10.77.0.2/32
+AllowedIPs = 10.77.0.10/32
 Endpoint = <monitor public address>:51820
 PersistentKeepalive = 25

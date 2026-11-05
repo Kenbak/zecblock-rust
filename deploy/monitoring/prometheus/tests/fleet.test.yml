@@ -7,7 +7,7 @@ tests:
   - name: host down pages after 3 minutes
     interval: 30s
     input_series:
-      - series: 'up{job="node",instance="10.77.0.11:9100",host="do-nyc3"}'
+      - series: 'up{job="node",instance="10.77.0.2:9100",host="do-nyc3"}'
         values: '1 1 0x10'
     alert_rule_test:
       - eval_time: 2m
@@ -16,14 +16,14 @@ tests:
       - eval_time: 5m
         alertname: HostDown
         exp_alerts:
-          - exp_labels: {severity: critical, job: node, instance: "10.77.0.11:9100", host: do-nyc3}
+          - exp_labels: {severity: critical, job: node, instance: "10.77.0.2:9100", host: do-nyc3}
             exp_annotations:
               summary: "do-nyc3 node_exporter unreachable over WireGuard for 3m"
 
   - name: CVE stopgap missing is critical, drops are info
     interval: 30s
     input_series:
-      - series: 'zecblock_cve_2026_98432_nft_table_present{instance="10.77.0.3:9100",host="standby"}'
+      - series: 'zecblock_cve_2026_98432_nft_table_present{instance="10.77.0.20:9100",host="standby"}'
         values: '1 1 0x10'
       - series: 'zecblock_cve_2026_98432_nft_dropped_packets_total{instance="10.77.0.1:9100",host="primary"}'
         values: '0 0 0 5 5 5 5 5 5 5'
@@ -31,7 +31,7 @@ tests:
       - eval_time: 4m
         alertname: Cve202698432StopgapMissing
         exp_alerts:
-          - exp_labels: {severity: critical, instance: "10.77.0.3:9100", host: standby}
+          - exp_labels: {severity: critical, instance: "10.77.0.20:9100", host: standby}
             exp_annotations:
               summary: "standby has no CVE-2026-98432 nft drop rule (table ip cve_2026_98432); host kernel is exposed"
       - eval_time: 4m
@@ -44,7 +44,7 @@ tests:
   - name: stale reboot after three days
     interval: 1h
     input_series:
-      - series: 'zecblock_reboot_required_since_timestamp_seconds{instance="10.77.0.5:9100",host="analytics"}'
+      - series: 'zecblock_reboot_required_since_timestamp_seconds{instance="10.77.0.22:9100",host="analytics"}'
         values: '0x100'
     alert_rule_test:
       - eval_time: 71h
@@ -53,22 +53,22 @@ tests:
       - eval_time: 73h
         alertname: RebootPendingStale
         exp_alerts:
-          - exp_labels: {severity: warning, instance: "10.77.0.5:9100", host: analytics}
+          - exp_labels: {severity: warning, instance: "10.77.0.22:9100", host: analytics}
             exp_annotations:
               summary: "analytics reboot pending for 3d 1h 0m 0s"
 
   - name: clock offset beyond the 10 ms observer gate
     interval: 1m
     input_series:
-      - series: 'zecblock_chrony_system_time_offset_seconds{instance="10.77.0.12:9100",host="do-sgp1"}'
+      - series: 'zecblock_chrony_system_time_offset_seconds{instance="10.77.0.3:9100",host="do-sgp1"}'
         values: '-0.015x20'
-      - series: 'zecblock_chrony_system_time_offset_seconds{instance="10.77.0.13:9100",host="do-syd1"}'
+      - series: 'zecblock_chrony_system_time_offset_seconds{instance="10.77.0.4:9100",host="do-syd1"}'
         values: '0.002x20'
     alert_rule_test:
       - eval_time: 15m
         alertname: ClockOffsetHigh
         exp_alerts:
-          - exp_labels: {severity: warning, instance: "10.77.0.12:9100", host: do-sgp1}
+          - exp_labels: {severity: warning, instance: "10.77.0.3:9100", host: do-sgp1}
             exp_annotations:
               summary: "do-sgp1 chrony offset 15ms (> 10 ms)"
 
@@ -128,7 +128,7 @@ tests:
     input_series:
       - series: 'state_full_verifier_committed_block_height{job="zakura",instance="10.77.0.1:9999",host="primary",network="mainnet"}'
         values: '3100000+1x60'
-      - series: 'state_full_verifier_committed_block_height{job="zakura",instance="10.77.0.11:9999",host="do-nyc3",network="mainnet"}'
+      - series: 'state_full_verifier_committed_block_height{job="zakura",instance="10.77.0.2:9999",host="do-nyc3",network="mainnet"}'
         values: '3099990x60'
     alert_rule_test:
       - eval_time: 15m
