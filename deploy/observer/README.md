@@ -106,3 +106,43 @@ remain.
   stays `collecting` while at least one is healthy. Per-observer coverage
   (migration 042) stays internal per the 2026-11-05 owner decision.
 - `capture.startedAt` is the minimum across observers, so it does not move.
+
+## Remote (third-party) Zakura nodes over mutual TLS
+
+Zakura serves plaintext indexer gRPC on loopback only; any other address
+requires mutual TLS (`[rpc.indexer_tls]`, Zakura >= 1.2.0). The collector
+supports this since Kenbak/zecblock-rust#49.
+
+**Operator side** (their node):
+```toml
+[rpc]
+indexer_listen_addr = "0.0.0.0:8230"
+listen_addr = "0.0.0.0:8232"          # JSON-RPC, firewall-allowlisted to our observer IPs
+
+[rpc.indexer_tls]
+cert_file = "/etc/zakura/tls/server.pem"
+key_file = "/etc/zakura/tls/server-key.pem"
+client_ca_file = "/etc/zakura/tls/zecblock-client-ca.pem"   # our public CA
+```
+They send us the CA that signed their server certificate and the name in it.
+
+**Our side** (collector on the closest observer), in its env file:
+```
+ZEBRA_GRPC_URL="https://<node-ip>:8230"
+ZEBRA_GRPC_TLS_CA_FILE="/etc/cipherscan/grpc-tls/<operator>-server-ca.pem"
+ZEBRA_GRPC_TLS_CERT_FILE="/etc/cipherscan/grpc-tls/client.pem"
+ZEBRA_GRPC_TLS_KEY_FILE="/etc/cipherscan/grpc-tls/client.key"
+ZEBRA_GRPC_TLS_DOMAIN="<name in their server cert>"   # when connecting by IP
+```
+Our client CA ("ZecBlock gRPC client CA", SHA-256
+`08:5E:27:4A:0E:18:B4:6C:A6:7D:37:D7:8A:04:B7:94:C4:0A:AE:BD:5C:B2:9E:28:FA:30:DE:13:10:26:C8:69`)
+signs one client certificate per observer (`CN=zecblock-observer-<region>`,
+clientAuth only, 2 years) at `/etc/cipherscan/grpc-tls/client.{pem,key}`
+(0640 root:zakura). The CA private key is kept offline by the owner.
+
+Verified 2026-11-05 on SGP1 with a test server CA: a request without a
+client certificate is refused (`tlsv13 alert certificate required`), one with
+it is accepted, and `orphan-shadow` from NYC3 over the public IP captured
+blocks. One collector process per remote node for now; template it per
+operator before adding more than a handful.
+
