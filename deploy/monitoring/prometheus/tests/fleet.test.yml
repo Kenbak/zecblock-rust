@@ -34,12 +34,14 @@ tests:
           - exp_labels: {severity: critical, instance: "10.77.0.20:9100", host: standby}
             exp_annotations:
               summary: "standby has no CVE-2026-98432 nft drop rule (table ip cve_2026_98432); host kernel is exposed"
+              title: "CVE-2026-98432 stopgap missing"
       - eval_time: 4m
         alertname: Cve202698432PacketsDropped
         exp_alerts:
           - exp_labels: {severity: info, instance: "10.77.0.1:9100", host: primary}
             exp_annotations:
               summary: "primary dropped 5 IPv4 TCP packets with IP options in 15m"
+              title: "CVE-2026-98432 packets dropped"
 
   - name: stale reboot after three days
     interval: 1h
