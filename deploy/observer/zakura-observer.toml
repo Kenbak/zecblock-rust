@@ -1,0 +1,18 @@
+# Regional observer Zakura config. Mirrors the passive standby's pruned
+# /root/.config/zakura.toml (read 2026-11-05, Zakura 1.8.0) except cache_dir.
+# P2P listens on the network default (0.0.0.0:8233). Cookie auth stays at its
+# default (on); the cookie is written to $HOME/.cache/zakura/.cookie, i.e.
+# /var/lib/zakura/.cache/zakura/.cookie for the zakura user (measured).
+
+[state]
+storage_mode = "pruned"
+cache_dir = "/var/lib/zakura/state"
+delete_old_database = false
+
+[network]
+network = "Mainnet"
+p2p_stack = "legacy"
+
+[rpc]
+indexer_listen_addr = "127.0.0.1:8230"
+listen_addr = "127.0.0.1:8232"

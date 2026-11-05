@@ -41,31 +41,31 @@ dashboard is private; nothing here feeds a public page.
   (`sql/monitor-role.sql`) and no `pg_monitor`/`pg_read_all_stats` (those
   expose other sessions' query text). It has no password: Unix-socket peer auth.
 - Scrapes go over WireGuard only. node_exporter binds the host's wg address;
-  UFW allows 9100 only from `10.77.0.2` on `wg0`. Prometheus, Alertmanager,
+  UFW allows 9100 only from `10.77.0.10` on `wg0`. Prometheus, Alertmanager,
   Grafana and the monitor's own node_exporter bind `127.0.0.1`.
 - This repository is public. It holds no public host addresses, keys, chat
   ids or tokens. A test fails if a public IPv4 address or a bot-token-shaped
   string appears under `deploy/monitoring/`.
 
-## Address plan (proposed)
+## Address plan
 
-The observer kit fixes only the hub `10.77.0.1` (primary). This plan assigns
-the rest; it must be confirmed before any peer is configured and then recorded
-in the wiki host table. Never reuse an address or host name.
+The hub `10.77.0.1` (primary) and the observers `.2–.4` are live (2026-11-05).
+The monitor takes `.10` and existing production hosts `.20–.26`; record each
+in the wiki host table when configured. Never reuse an address or host name.
 
 | wg address | host | role |
 |---|---|---|
 | 10.77.0.1 | primary | mainnet primary, observer `local-node`, PostgreSQL hub |
-| 10.77.0.2 | monitor | this stack |
-| 10.77.0.3 | standby | passive standby |
-| 10.77.0.4 | testnet | testnet |
-| 10.77.0.5 | analytics | analytics |
-| 10.77.0.6 | crosslink | Crosslink |
-| 10.77.0.7 | cipherpay-mainnet | CipherPay |
-| 10.77.0.8 | cipherpay-testnet | CipherPay testnet |
-| 10.77.0.9 | shopify | Shopify worker |
-| 10.77.0.11–13 | do-nyc3, do-sgp1, do-syd1 | regional observers |
-| 10.77.0.14–15 | vultr-sao, vultr-jnb | reserved (pending owner OK) |
+| 10.77.0.10 | monitor | this stack |
+| 10.77.0.20 | standby | passive standby |
+| 10.77.0.21 | testnet | testnet |
+| 10.77.0.22 | analytics | analytics |
+| 10.77.0.23 | crosslink | Crosslink |
+| 10.77.0.24 | cipherpay-mainnet | CipherPay |
+| 10.77.0.25 | cipherpay-testnet | CipherPay testnet |
+| 10.77.0.26 | shopify | Shopify worker |
+| 10.77.0.2–4 | do-nyc3, do-sgp1, do-syd1 | regional observers (live since 2026-11-05) |
+| 10.77.0.5–6 | vultr-sao, vultr-jnb | reserved (pending owner OK) |
 
 Topology: the monitor peers **directly** with every host (`/32` AllowedIPs
 both ways, see `wireguard/`), so it keeps working when the primary is down.
@@ -130,7 +130,7 @@ Each step has a check; stop on failure.
 5. **Exporters per host**: copy this directory, then
    `sudo python3 install.py host --wg-ip 10.77.0.N`. It installs/rebinds
    node_exporter to the wg address, the textfile timer, and
-   `ufw allow in on wg0 from 10.77.0.2 to 10.77.0.N port 9100`. Accept: from
+   `ufw allow in on wg0 from 10.77.0.10 to 10.77.0.N port 9100`. Accept: from
    the monitor `curl -s 10.77.0.N:9100/metrics | grep zecblock_cve_2026_98432_nft_table_present`
    returns 1; `ss -tlnp` on the host shows 9100 only on the wg address.
    Uncomment/keep the host in `prometheus/targets/node.yml`.
@@ -148,7 +148,7 @@ Each step has a check; stop on failure.
    the production Zakura build serves Prometheus metrics, set `[metrics]
    endpoint_addr = "10.77.0.N:9999"` (never `0.0.0.0`), restart that node in a
    maintenance window (standby first, primary last), allow
-   `ufw allow in on wg0 from 10.77.0.2 to 10.77.0.N port 9999 proto tcp`. Check
+   `ufw allow in on wg0 from 10.77.0.10 to 10.77.0.N port 9999 proto tcp`. Check
    the metric names against `zecblock:zakura_tip_height`/`zecblock:zakura_peers`
    in `prometheus/rules/fleet.rules.yml`; fix them there only. Until then keep
    the node's line in `targets/zakura.yml` commented out (an unreachable target

@@ -1,4 +1,4 @@
-# /etc/wireguard/wg0.conf on the MONITOR (10.77.0.2). Example only: copy, then
+# /etc/wireguard/wg0.conf on the MONITOR (10.77.0.10). Example only: copy, then
 # fill keys and endpoints on the host. Never commit the filled file.
 #
 # The monitor peers directly with every host (no hub), so monitoring keeps
@@ -6,7 +6,7 @@
 # AllowedIPs are /32 per host: the monitor can reach only each host's own wg
 # address, and hosts cannot route through the monitor.
 [Interface]
-Address = 10.77.0.2/24
+Address = 10.77.0.10/24
 ListenPort = 51820
 PostUp = wg set %i private-key /etc/wireguard/monitor.key
 
@@ -22,9 +22,9 @@ PersistentKeepalive = 25
 [Peer]
 # do-nyc3 observer
 PublicKey = <do-nyc3 wg public key>
-AllowedIPs = 10.77.0.11/32
+AllowedIPs = 10.77.0.2/32
 Endpoint = <do-nyc3 public address>:51820
 PersistentKeepalive = 25
 
-# ... standby 10.77.0.3, testnet .4, analytics .5, crosslink .6,
+# ... standby 10.77.0.20, testnet .4, analytics .5, crosslink .6,
 # cipherpay-mainnet .7, cipherpay-testnet .8, shopify .9, do-sgp1 .12, do-syd1 .13

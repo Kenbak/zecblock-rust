@@ -1,0 +1,41 @@
+[Unit]
+Description=ZecBlock regional competing-block collector
+After=network-online.target wg-quick@wg0.service zakurad-observer.service
+Requires=wg-quick@wg0.service
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+# Runs as the node user: it must read zakurad's 0600 RPC cookie, and the
+# empty CapabilityBoundingSet would stop root from reading another user's files.
+User=zakura
+Group=zakura
+WorkingDirectory=/var/lib/cipherscan-orphan-collector
+EnvironmentFile=/etc/cipherscan/orphan-collector.env
+Environment=TOKIO_WORKER_THREADS=2
+ExecStart=/opt/cipherscan-orphan-collector/cipherscan-indexer orphan-collect --journal /var/lib/cipherscan-orphan-collector --observer ${OBSERVER}
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=15
+StateDirectory=cipherscan-orphan-collector
+StateDirectoryMode=0700
+UMask=0077
+MemoryMax=256M
+MemorySwapMax=0
+CPUQuota=25%
+IOWeight=10
+Nice=10
+TasksMax=32
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target

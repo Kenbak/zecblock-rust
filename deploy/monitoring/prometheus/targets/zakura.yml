@@ -8,13 +8,13 @@
 # Crosslink runs a separate node build and is not listed.
 - targets: ['10.77.0.1:9999']
   labels: {host: primary, role: mainnet-primary, network: mainnet}
-- targets: ['10.77.0.3:9999']
+- targets: ['10.77.0.20:9999']
   labels: {host: standby, role: mainnet-standby, network: mainnet}
-- targets: ['10.77.0.4:9999']
+- targets: ['10.77.0.21:9999']
   labels: {host: testnet, role: testnet, network: testnet}
-- targets: ['10.77.0.11:9999']
+- targets: ['10.77.0.2:9999']
   labels: {host: do-nyc3, role: observer, network: mainnet}
-- targets: ['10.77.0.12:9999']
+- targets: ['10.77.0.3:9999']
   labels: {host: do-sgp1, role: observer, network: mainnet}
-- targets: ['10.77.0.13:9999']
+- targets: ['10.77.0.4:9999']
   labels: {host: do-syd1, role: observer, network: mainnet}
