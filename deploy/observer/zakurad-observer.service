@@ -1,0 +1,23 @@
+[Unit]
+Description=Zakura pruned mainnet node (regional block observer)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=zakura
+Group=zakura
+ExecStart=/usr/local/bin/zakurad -c /etc/zakura/zakura.toml start
+Restart=on-failure
+RestartSec=10
+LimitNOFILE=65536
+MemoryMax=6G
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/zakura
+ProtectHome=yes
+UMask=0027
+
+[Install]
+WantedBy=multi-user.target

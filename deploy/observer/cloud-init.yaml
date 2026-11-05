@@ -1,0 +1,48 @@
+#cloud-config
+# Regional block observer base image. Contains no secrets: the WireGuard key is
+# generated on the host, and the DB password arrives later over SSH.
+# Replace ADMIN_SSH_KEY, ADMIN_CIDR and PRIMARY_PUBLIC_IP before use.
+package_update: true
+package_upgrade: true
+packages:
+  - chrony
+  - wireguard
+  - ufw
+  - fail2ban
+  - unattended-upgrades
+  - prometheus-node-exporter
+  - python3
+users:
+  - name: zakura
+    system: true
+    shell: /usr/sbin/nologin
+    home: /var/lib/zakura
+ssh_authorized_keys:
+  - ADMIN_SSH_KEY
+write_files:
+  - path: /etc/ssh/sshd_config.d/10-observer.conf
+    content: |
+      PasswordAuthentication no
+      KbdInteractiveAuthentication no
+      PermitRootLogin prohibit-password
+  - path: /etc/sysctl.d/99-disable-mptcp.conf
+    content: |
+      net.mptcp.enabled = 0
+  - path: /etc/default/prometheus-node-exporter
+    # Bound to the WireGuard address only; wg0 must be up before it starts.
+    content: |
+      ARGS="--web.listen-address=WG_ADDRESS:9100"
+runcmd:
+  - [sysctl, --system]
+  - [systemctl, restart, ssh]
+  - [systemctl, enable, --now, chrony]
+  - [install, -d, -o, zakura, -g, zakura, -m, "0700", /var/lib/zakura]
+  - [install, -d, -m, "0700", /etc/zakura, /etc/cipherscan]
+  - [sh, -c, "umask 077 && wg genkey | tee /etc/wireguard/observer.key | wg pubkey > /etc/wireguard/observer.pub"]
+  - [ufw, default, deny, incoming]
+  - [ufw, default, allow, outgoing]
+  - [ufw, allow, from, ADMIN_CIDR, to, any, port, "22", proto, tcp]
+  - [ufw, allow, "8233/tcp"]
+  - [ufw, allow, from, PRIMARY_PUBLIC_IP, to, any, port, "51820", proto, udp]
+  - [ufw, --force, enable]
+  - [systemctl, enable, --now, fail2ban]

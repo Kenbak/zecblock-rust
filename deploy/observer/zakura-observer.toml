@@ -1,0 +1,23 @@
+# Regional observer Zakura config TEMPLATE.
+# Key names follow upstream Zebra plus Zakura's documented `storage_mode`; they
+# are NOT verified against a running Zakura config. Diff against the standby's
+# /root/.config/zakura.toml (also pruned) before first start.
+
+[network]
+network = "Mainnet"
+listen_addr = "0.0.0.0:8233"
+
+[state]
+cache_dir = "/var/lib/zakura/state"
+storage_mode = "pruned"
+
+[rpc]
+# Loopback only. The collector authenticates with the cookie.
+listen_addr = "127.0.0.1:8232"
+indexer_listen_addr = "127.0.0.1:8230"
+enable_cookie_auth = true
+cookie_dir = "/var/lib/zakura"
+
+[metrics]
+# Requires the prometheus build feature; scraped through an SSH/WG tunnel only.
+endpoint_addr = "127.0.0.1:9999"
