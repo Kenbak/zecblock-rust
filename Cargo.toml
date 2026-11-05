@@ -34,7 +34,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 sha2 = "0.10"
 ripemd = "0.1"
 bs58 = "0.5"
-base64 = "0.22"
+base64 = "0.23"
 
 # Environment
 dotenvy = "0.15"
