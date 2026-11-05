@@ -33,11 +33,13 @@ route:
     - matchers: [severity = "warning"]
       receiver: telegram
       repeat_interval: 12h
+    # Informational: one silent batch (no phone notification), at most every 6 h,
+    # re-sent daily while still open.
     - matchers: [severity = "info"]
-      receiver: telegram
-      group_by: [alertname]
-      group_wait: 5m
-      group_interval: 30m
+      receiver: telegram-quiet
+      group_by: [severity]
+      group_wait: 10m
+      group_interval: 6h
       repeat_interval: 24h
 
 inhibit_rules:
@@ -69,6 +71,14 @@ receivers:
         chat_id: ${TELEGRAM_CHAT_ID}
         parse_mode: HTML
         disable_notifications: false
+        send_resolved: true
+        message: '{{ template "zecblock.telegram.message" . }}'
+  - name: telegram-quiet
+    telegram_configs:
+      - bot_token_file: ${SECRETS_DIR}/telegram-bot-token
+        chat_id: ${TELEGRAM_CHAT_ID}
+        parse_mode: HTML
+        disable_notifications: true
         send_resolved: true
         message: '{{ template "zecblock.telegram.message" . }}'
 # HEARTBEAT-BEGIN

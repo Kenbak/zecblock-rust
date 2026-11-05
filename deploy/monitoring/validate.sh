@@ -47,7 +47,20 @@ expect_route() {
 expect_route heartbeat alertname=Watchdog severity=none
 expect_route telegram alertname=HostDown severity=critical host=primary
 expect_route telegram alertname=ClockOffsetHigh severity=warning host=do-sgp1
-expect_route telegram alertname=RebootPending severity=info host=analytics
+expect_route telegram-quiet alertname=RebootPending severity=info host=analytics
+
+echo "== telegram template renders (fixtures)"
+for data in "$here"/alertmanager/fixtures/*.json; do
+  want="${data%.json}.expected"
+  got="$("$amtool" template render --template.glob="$here/alertmanager/telegram.tmpl" \
+    --template.data="$data" --template.text='{{ template "zecblock.telegram.message" . }}')"
+  if [[ "$(printf '%s' "$got" | sed -e '/^$/d')" != "$(sed -e '/^$/d' "$want")" ]]; then
+    echo "template render mismatch for $(basename "$data")" >&2
+    diff <(printf '%s\n' "$got" | sed -e '/^$/d') <(sed -e '/^$/d' "$want") >&2 || true
+    exit 1
+  fi
+  echo "ok  $(basename "$data")"
+done
 
 echo "== grafana dashboard JSON"
 python3 -m json.tool "$here/grafana/dashboards/zecblock-fleet.json" > /dev/null
