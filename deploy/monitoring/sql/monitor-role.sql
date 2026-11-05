@@ -3,8 +3,9 @@
 --   sudo -u postgres psql -X -v ON_ERROR_STOP=1 -d zcash_explorer_mainnet -f monitor-role.sql
 -- Idempotent. No password: the exporter connects over the local Unix socket as
 -- OS user zecblock-monitor with peer authentication, so no secret exists.
+-- pg_ident.conf needs:   zecblock_monitor  zecblock-monitor  zecblock_monitor
 -- pg_hba.conf needs (reload only, no restart), above any broader local rule:
---   local  zcash_explorer_mainnet  zecblock_monitor  peer
+--   local  zcash_explorer_mainnet  zecblock_monitor  peer map=zecblock_monitor
 --
 -- Grants are table-level SELECT on exactly the tables the exporter reads.
 -- Deliberately NOT granted: nodes, nodes_crawl, topology_gossip_edges and any

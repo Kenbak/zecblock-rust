@@ -7,6 +7,8 @@ After=postgresql.service
 Type=oneshot
 User=zecblock-monitor
 Group=zecblock-monitor
+# OS user zecblock-monitor maps to DB role zecblock_monitor via pg_ident (map zecblock_monitor).
+Environment=PGUSER=zecblock_monitor
 StateDirectory=zecblock-capture-exporter
 StateDirectoryMode=0755
 ExecStart=/usr/bin/python3 /opt/zecblock-monitor/bin/zecblock-capture-exporter.py \
