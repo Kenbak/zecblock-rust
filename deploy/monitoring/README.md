@@ -137,7 +137,9 @@ Each step has a check; stop on failure.
 6. **Capture exporter (primary only)**: `sudo python3 install.py
    primary-capture --network mainnet`. Then the owner-approved database step it
    prints: run `sql/monitor-role.sql` as postgres in `zcash_explorer_mainnet`,
-   add `local zcash_explorer_mainnet zecblock_monitor peer` above broader local
+   add `zecblock_monitor zecblock-monitor zecblock_monitor` to `pg_ident.conf` (the OS
+   user has a hyphen, the role an underscore) and
+   `local zcash_explorer_mainnet zecblock_monitor peer map=zecblock_monitor` above broader local
    rules in `pg_hba.conf`, and **reload** (not restart) PostgreSQL. Check
    `sudo -u zecblock-monitor psql -X -d zcash_explorer_mainnet -c 'select 1'`,
    then `systemctl enable --now zecblock-capture-exporter@mainnet.timer`. Repeat

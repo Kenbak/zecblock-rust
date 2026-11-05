@@ -224,7 +224,8 @@ def install_primary_capture(plan, network):
     db = f'zcash_explorer_{network}'
     print('\nOwner-approved manual PostgreSQL step (reload only, no restart):\n'
           f'  sudo -u postgres psql -X -v ON_ERROR_STOP=1 -d {db} -f {HERE / "sql/monitor-role.sql"}\n'
-          f'  add to pg_hba.conf above broader local rules:  local  {db}  zecblock_monitor  peer\n'
+          f'  add to pg_ident.conf:  zecblock_monitor  zecblock-monitor  zecblock_monitor\n'
+          f'  add to pg_hba.conf above broader local rules:  local  {db}  zecblock_monitor  peer map=zecblock_monitor\n'
           '  sudo systemctl reload postgresql\n'
           f'  sudo -u zecblock-monitor psql -X -d {db} -c "select 1"\n'
           f'Then: systemctl enable --now zecblock-capture-exporter@{network}.timer')
