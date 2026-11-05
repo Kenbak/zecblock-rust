@@ -14,7 +14,6 @@ use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tonic::transport::Endpoint;
 use zakura_chain::block::{Block, MAX_BLOCK_BYTES};
 use zakura_chain::serialization::ZcashDeserialize;
 
@@ -540,8 +539,9 @@ async fn run_capture_inner(
             break;
         }
         let session = async {
-            let endpoint = Endpoint::from_shared(url.to_owned())
-                .map_err(|_| "invalid capture gRPC URL")?
+            let endpoint = super::grpc_tls::GrpcTls::from_env()
+                .endpoint(url)
+                .map_err(|_| "invalid capture gRPC URL or TLS configuration")?
                 .connect_timeout(Duration::from_secs(5))
                 .tcp_keepalive(Some(Duration::from_secs(30)));
             let mut client = IndexerClient::new(

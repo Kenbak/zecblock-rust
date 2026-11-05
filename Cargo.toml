@@ -43,7 +43,7 @@ dotenvy = "0.15"
 reqwest = { version = "0.12", features = ["json"] }
 
 # gRPC client for Zebra indexer streaming
-tonic = "0.12"
+tonic = { version = "0.12", features = ["tls"] }
 prost = "0.13"
 
 [dev-dependencies]
