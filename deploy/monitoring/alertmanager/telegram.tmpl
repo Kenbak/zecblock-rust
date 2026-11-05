@@ -1,0 +1,8 @@
+{{/* Telegram HTML message. Only alert names, labels and summaries: no URLs to private hosts. */}}
+{{ define "zecblock.telegram.message" -}}
+{{ if eq .Status "firing" }}{{ if eq .CommonLabels.severity "critical" }}🔴{{ else if eq .CommonLabels.severity "warning" }}🟠{{ else }}🔵{{ end }}{{ else }}✅{{ end }} <b>{{ .Status | toUpper }}</b> {{ .CommonLabels.alertname | html }}{{ if .CommonLabels.severity }} [{{ .CommonLabels.severity | html }}]{{ end }}
+{{ range .Alerts -}}
+• {{ .Annotations.summary | html }}
+{{ end -}}
+<i>zecblock-fleet monitor</i>
+{{- end }}

@@ -1,0 +1,20 @@
+# Zakura (Zebra-derived) Prometheus endpoints, scraped over WireGuard only.
+#
+# UNVERIFIED: Zakura's metrics endpoint ([metrics] endpoint_addr) requires a
+# build with the prometheus feature, and the production binaries have not been
+# checked for it. Each node must bind it to its wg address (never 0.0.0.0 or a
+# public address). Until a node is verified, keep its target commented out.
+#
+# Crosslink runs a separate node build and is not listed.
+- targets: ['10.77.0.1:9999']
+  labels: {host: primary, role: mainnet-primary, network: mainnet}
+- targets: ['10.77.0.3:9999']
+  labels: {host: standby, role: mainnet-standby, network: mainnet}
+- targets: ['10.77.0.4:9999']
+  labels: {host: testnet, role: testnet, network: testnet}
+- targets: ['10.77.0.11:9999']
+  labels: {host: do-nyc3, role: observer, network: mainnet}
+- targets: ['10.77.0.12:9999']
+  labels: {host: do-sgp1, role: observer, network: mainnet}
+- targets: ['10.77.0.13:9999']
+  labels: {host: do-syd1, role: observer, network: mainnet}

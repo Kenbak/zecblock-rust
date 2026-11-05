@@ -1,0 +1,79 @@
+# ZecBlock Alertmanager TEMPLATE. Rendered at service start by
+# render-alertmanager.py into /run/zecblock-alertmanager/alertmanager.yml (0600).
+#
+# Secrets never live in this file or in git:
+#   /etc/zecblock-monitor/telegram.env  (0640 root:zecblock-alertmanager)  TELEGRAM_CHAT_ID=<integer>
+#   /etc/zecblock-monitor/telegram-bot-token (0640 root:zecblock-alertmanager)
+#   /etc/zecblock-monitor/heartbeat-url  (optional, 0640) dead-man URL for Watchdog
+# Placeholders (dollar-brace): TELEGRAM_CHAT_ID, SECRETS_DIR, TEMPLATES_DIR, WATCHDOG_RECEIVER.
+# The heartbeat block between the HEARTBEAT markers is kept only when
+# heartbeat-url exists; otherwise Watchdog goes to `blackhole`.
+global:
+  resolve_timeout: 5m
+
+templates:
+  - ${TEMPLATES_DIR}/telegram.tmpl
+
+route:
+  receiver: telegram
+  group_by: [alertname, network, host]
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 12h
+  routes:
+    - matchers: [alertname = "Watchdog"]
+      receiver: ${WATCHDOG_RECEIVER}
+      group_wait: 0s
+      group_interval: 1m
+      repeat_interval: 1m
+    - matchers: [severity = "critical"]
+      receiver: telegram
+      group_wait: 10s
+      repeat_interval: 2h
+    - matchers: [severity = "warning"]
+      receiver: telegram
+      repeat_interval: 12h
+    - matchers: [severity = "info"]
+      receiver: telegram
+      group_by: [alertname]
+      group_wait: 5m
+      group_interval: 30m
+      repeat_interval: 24h
+
+inhibit_rules:
+  # A host that is down explains everything else about it.
+  - source_matchers: [alertname = "HostDown"]
+    target_matchers: [alertname != "HostDown"]
+    equal: [host]
+  # No database answer: per-observer and census values are stale, not new facts.
+  - source_matchers: [alertname = "CaptureExporterDown"]
+    target_matchers: [alertname =~ "Capture.+|Census.+", alertname != "CaptureExporterDown"]
+    equal: [network]
+  # Fleet-wide no-healthy-observer supersedes per-observer heartbeat/stream pages.
+  - source_matchers: [alertname = "CaptureNoHealthyObserver"]
+    target_matchers: [alertname =~ "CaptureObserver(HeartbeatStale|StreamDisconnected)"]
+    equal: [network]
+  # Critical variants supersede their warning twins.
+  - source_matchers: [alertname = "DiskSpaceCritical"]
+    target_matchers: [alertname =~ "DiskSpaceLow|DiskFillsWithin24h"]
+    equal: [host, mountpoint]
+  - source_matchers: [alertname = "CaptureObserverJournalNearlyFull"]
+    target_matchers: [alertname = "CaptureObserverJournalFilling"]
+    equal: [network, observer]
+
+receivers:
+  - name: blackhole
+  - name: telegram
+    telegram_configs:
+      - bot_token_file: ${SECRETS_DIR}/telegram-bot-token
+        chat_id: ${TELEGRAM_CHAT_ID}
+        parse_mode: HTML
+        disable_notifications: false
+        send_resolved: true
+        message: '{{ template "zecblock.telegram.message" . }}'
+# HEARTBEAT-BEGIN
+  - name: heartbeat
+    webhook_configs:
+      - url_file: ${SECRETS_DIR}/heartbeat-url
+        send_resolved: false
+# HEARTBEAT-END

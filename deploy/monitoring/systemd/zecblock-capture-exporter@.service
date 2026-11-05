@@ -1,0 +1,29 @@
+# Primary only. Instance = network (mainnet|testnet); database zcash_explorer_<network>.
+[Unit]
+Description=ZecBlock orphan-capture observer and census freshness metrics (%i)
+After=postgresql.service
+
+[Service]
+Type=oneshot
+User=zecblock-monitor
+Group=zecblock-monitor
+StateDirectory=zecblock-capture-exporter
+StateDirectoryMode=0755
+ExecStart=/usr/bin/python3 /opt/zecblock-monitor/bin/zecblock-capture-exporter.py \
+  --network %i --database zcash_explorer_%i --dir /var/lib/zecblock-capture-exporter
+# The exporter always writes a file (with zecblock_capture_exporter_up 0 on DB errors);
+# root then publishes it atomically into node_exporter's textfile directory.
+ExecStartPost=+/bin/sh -c 'cp /var/lib/zecblock-capture-exporter/zecblock_capture_%i.prom /var/lib/prometheus/node-exporter/.zecblock_capture_%i.prom.tmp && mv -f /var/lib/prometheus/node-exporter/.zecblock_capture_%i.prom.tmp /var/lib/prometheus/node-exporter/zecblock_capture_%i.prom'
+TimeoutStartSec=40
+Nice=10
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictAddressFamilies=AF_UNIX
+CapabilityBoundingSet=

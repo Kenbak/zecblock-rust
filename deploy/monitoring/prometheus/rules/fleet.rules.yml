@@ -1,0 +1,337 @@
+# ZecBlock fleet alerting and recording rules.
+# Severity: critical (page now), warning (look today), info (context, low rate).
+# Every alert carries a `summary` annotation used by the Telegram template; it
+# must never interpolate secrets, IPs other than wg addresses, or query data.
+# Thresholds marked "initial" are first guesses to be tuned after a week of data.
+groups:
+  - name: zecblock-recording
+    rules:
+      # UNVERIFIED Zakura metric names (Zebra-derived). Fix here only if the
+      # production build names them differently; alerts and dashboard use these.
+      - record: zecblock:zakura_tip_height
+        expr: >
+          max by (host, network) (state_full_verifier_committed_block_height)
+          or max by (host, network) (zcash_chain_verified_block_height)
+      - record: zecblock:zakura_peers
+        expr: max by (host, network) (zcash_net_peers)
+      - record: zecblock:zakura_tip_lag_blocks
+        expr: >
+          max by (network) (zecblock:zakura_tip_height)
+          - on (network) group_right zecblock:zakura_tip_height
+      - record: zecblock:capture_observer_healthy
+        # Healthy = heartbeat within the 45 s acceptance bound and stream connected.
+        expr: >
+          (zecblock_capture_observer_heartbeat_age_seconds < bool 45)
+          * on (network, observer) zecblock_capture_observer_stream_connected
+
+  - name: zecblock-hosts
+    rules:
+      - alert: HostDown
+        expr: up{job=~"node|node-monitor"} == 0
+        for: 3m
+        labels: {severity: critical}
+        annotations:
+          summary: "{{ $labels.host }} node_exporter unreachable over WireGuard for 3m"
+      - alert: HostTextfileStale
+        expr: time() - node_textfile_mtime_seconds{file=~".*zecblock_.*\\.prom"} > 300
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: "{{ $labels.host }} textfile {{ $labels.file }} not refreshed for {{ $value | humanizeDuration }}"
+      - alert: HostTextfileMissing
+        expr: up{job="node"} == 1 unless on (instance) zecblock_host_textfile_last_run_timestamp_seconds
+        for: 15m
+        labels: {severity: warning}
+        annotations:
+          summary: "{{ $labels.host }} has no zecblock_host.prom (CVE/reboot/clock state unknown)"
+      - alert: HostTextfileScrapeError
+        expr: node_textfile_scrape_error == 1
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: "{{ $labels.host }} node_exporter cannot parse a textfile"
+      - alert: DiskSpaceLow
+        expr: >
+          node_filesystem_avail_bytes{fstype!~"tmpfs|overlay|squashfs|ramfs",mountpoint!~"/boot.*|/snap.*"}
+          / node_filesystem_size_bytes < 0.10
+        for: 15m
+        labels: {severity: warning}
+        annotations:
+          summary: "{{ $labels.host }} {{ $labels.mountpoint }} has {{ $value | humanizePercentage }} free"
+      - alert: DiskSpaceCritical
+        expr: >
+          node_filesystem_avail_bytes{fstype!~"tmpfs|overlay|squashfs|ramfs",mountpoint!~"/boot.*|/snap.*"}
+          / node_filesystem_size_bytes < 0.05
+        for: 5m
+        labels: {severity: critical}
+        annotations:
+          summary: "{{ $labels.host }} {{ $labels.mountpoint }} has {{ $value | humanizePercentage }} free"
+      - alert: DiskFillsWithin24h
+        expr: >
+          predict_linear(node_filesystem_avail_bytes{fstype!~"tmpfs|overlay|squashfs|ramfs",mountpoint!~"/boot.*|/snap.*"}[6h], 86400) < 0
+          and node_filesystem_avail_bytes / node_filesystem_size_bytes < 0.25
+        for: 1h
+        labels: {severity: warning}
+        annotations:
+          summary: "{{ $labels.host }} {{ $labels.mountpoint }} projected full within 24h"
+      - alert: MemoryLow
+        expr: node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes < 0.05
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: "{{ $labels.host }} has {{ $value | humanizePercentage }} memory available"
+      - alert: OomKill
+        expr: increase(node_vmstat_oom_kill[30m]) > 0
+        labels: {severity: warning}
+        annotations:
+          summary: "{{ $labels.host }} kernel OOM-killed a process in the last 30m"
+
+  - name: zecblock-security
+    rules:
+      - alert: Cve202698432StopgapMissing
+        expr: zecblock_cve_2026_98432_nft_table_present == 0
+        for: 2m
+        labels: {severity: critical}
+        annotations:
+          summary: "{{ $labels.host }} has no CVE-2026-98432 nft drop rule (table ip cve_2026_98432); host kernel is exposed"
+      - alert: MptcpEnabled
+        expr: zecblock_mptcp_enabled == 1
+        for: 2m
+        labels: {severity: critical}
+        annotations:
+          summary: "{{ $labels.host }} has net.mptcp.enabled=1"
+      - alert: Cve202698432PacketsDropped
+        # Signal only: IPv4 TCP with IP options is rare in legitimate traffic.
+        expr: increase(zecblock_cve_2026_98432_nft_dropped_packets_total[15m]) > 0
+        labels: {severity: info}
+        annotations:
+          summary: "{{ $labels.host }} dropped {{ $value | printf \"%.0f\" }} IPv4 TCP packets with IP options in 15m"
+      - alert: RebootPending
+        expr: zecblock_reboot_required == 1 or zecblock_kernel_newer_installed == 1
+        for: 1h
+        labels: {severity: info}
+        annotations:
+          summary: "{{ $labels.host }} needs a reboot (installed kernel/packages not active)"
+      - alert: RebootPendingStale
+        # Observers reboot automatically at 04:00; production hosts need an owner-approved reboot.
+        # The since-timestamp exists only while /run/reboot-required exists.
+        expr: time() - zecblock_reboot_required_since_timestamp_seconds > 3 * 86400
+        labels: {severity: warning}
+        annotations:
+          summary: "{{ $labels.host }} reboot pending for {{ $value | humanizeDuration }}"
+
+  - name: zecblock-clock
+    rules:
+      - alert: ClockOffsetHigh
+        # Observer gate: receipt times are compared across hosts, keep within 10 ms.
+        expr: abs(zecblock_chrony_system_time_offset_seconds) > 0.010
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: "{{ $labels.host }} chrony offset {{ $value | humanizeDuration }} (> 10 ms)"
+      - alert: ClockUnsynchronised
+        expr: zecblock_chrony_synchronised == 0
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: "{{ $labels.host }} chrony is not synchronised"
+      - alert: ChronyDown
+        # Only hosts where chrony answered in the last day (some hosts may use timesyncd).
+        expr: zecblock_chrony_up == 0 and on (instance) max_over_time(zecblock_chrony_up[1d]) == 1
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: "{{ $labels.host }} chronyc tracking stopped answering"
+      - alert: KernelClockUnsynchronised
+        expr: node_timex_sync_status == 0
+        for: 15m
+        labels: {severity: warning}
+        annotations:
+          summary: "{{ $labels.host }} kernel reports the clock unsynchronised"
+
+  - name: zecblock-zakura
+    rules:
+      - alert: ZakuraMetricsDown
+        expr: up{job="zakura"} == 0
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: "{{ $labels.host }} Zakura metrics endpoint unreachable"
+      - alert: ZakuraTipBehind
+        expr: zecblock:zakura_tip_lag_blocks > 3
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: "{{ $labels.host }} ({{ $labels.network }}) is {{ $value }} blocks behind the best fleet node"
+      - alert: ZakuraTipStalled
+        # ~75 s blocks: no height change in 45 m is ~e^-36 unlikely by chance.
+        # The offset term requires 45 m of history, so a new node does not page at once.
+        expr: >
+          delta(zecblock:zakura_tip_height[45m]) <= 0
+          and on (host, network) (zecblock:zakura_tip_height offset 45m)
+        for: 5m
+        labels: {severity: critical}
+        annotations:
+          summary: "{{ $labels.host }} ({{ $labels.network }}) tip has not advanced for 45m"
+      - alert: ZakuraFewPeers
+        expr: zecblock:zakura_peers < 8
+        for: 15m
+        labels: {severity: warning}
+        annotations:
+          summary: "{{ $labels.host }} has {{ $value }} Zakura peers"
+
+  - name: zecblock-capture
+    rules:
+      - alert: CaptureExporterDown
+        expr: zecblock_capture_exporter_up == 0
+        for: 3m
+        labels: {severity: critical}
+        annotations:
+          summary: "capture/census exporter for {{ $labels.network }} cannot query PostgreSQL"
+      - alert: CaptureExporterMissing
+        expr: up{job="node",host="primary"} == 1 unless on (instance) zecblock_capture_exporter_last_run_timestamp_seconds{network="mainnet"}
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: "primary has no zecblock_capture_mainnet.prom"
+      - alert: CaptureObserverHeartbeatStale
+        # Collector heartbeats every 15 s; acceptance bound is 45 s. Silence retired observers.
+        expr: zecblock_capture_observer_heartbeat_age_seconds > 45
+        for: 2m
+        labels: {severity: critical}
+        annotations:
+          summary: "observer {{ $labels.observer }} ({{ $labels.network }}) heartbeat {{ $value | humanizeDuration }} old"
+      - alert: CaptureObserverStreamDisconnected
+        expr: zecblock_capture_observer_stream_connected == 0
+        for: 5m
+        labels: {severity: critical}
+        annotations:
+          summary: "observer {{ $labels.observer }} ({{ $labels.network }}) block stream disconnected"
+      - alert: CaptureNoHealthyObserver
+        expr: max by (network) (zecblock:capture_observer_healthy) == 0
+        for: 2m
+        labels: {severity: critical}
+        annotations:
+          summary: "no healthy orphan-capture observer on {{ $labels.network }}: competing blocks are not being captured"
+      - alert: CaptureObserverPendingRecords
+        expr: zecblock_capture_observer_pending_records > 0
+        for: 15m
+        labels: {severity: warning}
+        annotations:
+          summary: "observer {{ $labels.observer }} has {{ $value }} journal records not yet in PostgreSQL for 15m"
+      - alert: CaptureObserverJournalFilling
+        expr: zecblock_capture_observer_pending_bytes / zecblock_capture_observer_journal_max_bytes > 0.5
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: "observer {{ $labels.observer }} journal {{ $value | humanizePercentage }} full"
+      - alert: CaptureObserverJournalNearlyFull
+        expr: zecblock_capture_observer_pending_bytes / zecblock_capture_observer_journal_max_bytes > 0.9
+        for: 2m
+        labels: {severity: critical}
+        annotations:
+          summary: "observer {{ $labels.observer }} journal {{ $value | humanizePercentage }} full; captures will be lost"
+      - alert: CaptureObserverGaps
+        expr: increase(zecblock_capture_observer_gaps_total[1h]) > 0
+        labels: {severity: warning}
+        annotations:
+          summary: "observer {{ $labels.observer }} recorded {{ $value | printf \"%.0f\" }} stream gaps in 1h"
+      - alert: CaptureObserverNoRecentReceipts
+        # initial: ~16 blocks expected in 20 m.
+        expr: zecblock_capture_observer_last_receipt_age_seconds > 1200 and on (network, observer) zecblock_capture_observer_heartbeat_age_seconds < 45
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: "observer {{ $labels.observer }} is alive but wrote no receipt for {{ $value | humanizeDuration }}"
+      - alert: CaptureCoverageColumnsMissing
+        expr: zecblock_capture_schema_present{object="migration_042_coverage"} == 0
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: "{{ $labels.network }} database lacks migration 042 coverage columns"
+      - alert: CaptureObserverCoverageUntimed
+        # 042 present but this observer never wrote coverage_since: it runs a pre-042 collector.
+        expr: >
+          (zecblock_capture_observer_heartbeat_age_seconds < 45)
+          unless on (network, observer) zecblock_capture_observer_coverage_age_seconds
+          and on (network) zecblock_capture_schema_present{object="migration_042_coverage"} == 1
+        for: 30m
+        labels: {severity: warning}
+        annotations:
+          summary: "observer {{ $labels.observer }} is not writing migration 042 timed coverage"
+      - alert: CaptureAuditStale
+        # Default audit interval is 300 s.
+        expr: zecblock_capture_observer_audit_age_seconds > 900 and on (network, observer) zecblock_capture_observer_heartbeat_age_seconds < 45
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: "observer {{ $labels.observer }} coverage audit last ran {{ $value | humanizeDuration }} ago"
+      - alert: CaptureAuditFailing
+        expr: zecblock_capture_observer_audit_ok == 0
+        for: 15m
+        labels: {severity: warning}
+        annotations:
+          summary: "observer {{ $labels.observer }} coverage audit is failing (see audit_status)"
+      - alert: CaptureCanonicalBlocksMissing
+        expr: zecblock_capture_observer_audit_canonical_missing > 0
+        for: 10m
+        labels: {severity: critical}
+        annotations:
+          summary: "observer {{ $labels.observer }}: {{ $value }} recent canonical blocks missing from captured_blocks"
+      - alert: CaptureAuditMissesOpen
+        expr: zecblock_capture_observer_audit_misses_open > 0
+        for: 30m
+        labels: {severity: warning}
+        annotations:
+          summary: "observer {{ $labels.observer }} has {{ $value }} fork blocks the node validated but the collector never captured"
+
+  - name: zecblock-census
+    rules:
+      - alert: CensusGossipStale
+        # initial; public eligibility of gossip edges expires after 10 minutes.
+        expr: zecblock_census_gossip_age_seconds > 1200
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: "census gossip from {{ $labels.collector_source }} is {{ $value | humanizeDuration }} old"
+      - alert: CensusGossipTruncated
+        expr: zecblock_census_gossip_truncated == 1
+        for: 1h
+        labels: {severity: info}
+        annotations:
+          summary: "census gossip snapshot from {{ $labels.collector_source }} is truncated at the edge cap"
+      - alert: CensusSnapshotStale
+        # initial; census v3 is the current published version.
+        expr: zecblock_census_snapshot_age_seconds{census_version="3"} > 7200
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: "newest census v3 snapshot on {{ $labels.network }} is {{ $value | humanizeDuration }} old"
+      - alert: CensusSnapshotMissing
+        expr: >
+          zecblock_capture_schema_present{object="node_snapshots"} == 1
+          unless on (network) zecblock_census_snapshot_age_seconds{census_version="3"}
+        for: 30m
+        labels: {severity: warning}
+        annotations:
+          summary: "no census v3 snapshot on {{ $labels.network }} in 7 days"
+
+  - name: zecblock-monitoring
+    rules:
+      - alert: Watchdog
+        # Always firing. Routed to the dead-man heartbeat receiver (if configured)
+        # so an outside service notices when this monitor or its Alertmanager dies.
+        expr: vector(1)
+        labels: {severity: none}
+        annotations:
+          summary: "monitoring pipeline heartbeat"
+      - alert: PrometheusRuleFailures
+        expr: increase(prometheus_rule_evaluation_failures_total[10m]) > 0
+        labels: {severity: warning}
+        annotations:
+          summary: "Prometheus rule evaluation failures in {{ $labels.rule_group }}"
+      - alert: AlertmanagerNotificationsFailing
+        expr: increase(alertmanager_notifications_failed_total[15m]) > 0
+        labels: {severity: critical}
+        annotations:
+          summary: "Alertmanager failed to deliver {{ $value | printf \"%.0f\" }} {{ $labels.integration }} notifications in 15m"
