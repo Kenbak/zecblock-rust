@@ -1,7 +1,10 @@
 # ZecBlock fleet alerting and recording rules.
 # Severity: critical (page now), warning (look today), info (context, low rate).
-# Every alert carries a `summary` annotation used by the Telegram template; it
-# must never interpolate secrets, IPs other than wg addresses, or query data.
+# Every alert carries plain-language annotations for the Telegram template:
+#   title (short headline), summary (what is happening, no host name: the
+#   template adds a friendly location), impact (why it matters) and action
+#   (what to do). Written for a non-specialist reader. They must never
+#   interpolate secrets, IPs, or query data.
 # Thresholds marked "initial" are first guesses to be tuned after a week of data.
 groups:
   - name: zecblock-recording
@@ -31,25 +34,37 @@ groups:
         for: 3m
         labels: {severity: critical}
         annotations:
-          summary: "{{ $labels.host }} node_exporter unreachable over WireGuard for 3m"
+          title: "Server not responding"
+          summary: "Monitoring has not been able to reach this server for 3 minutes."
+          impact: "If this is the main server, the website and API are probably down. If it is an observer, orphan tracking just has one fewer vantage point."
+          action: "Try to SSH in. If it does not answer, open the provider console (Hetzner or DigitalOcean) and check whether it is running; a reboot from there usually brings it back."
       - alert: HostTextfileStale
         expr: time() - node_textfile_mtime_seconds{file=~".*zecblock_.*\\.prom"} > 300
         for: 5m
         labels: {severity: warning}
         annotations:
-          summary: "{{ $labels.host }} textfile {{ $labels.file }} not refreshed for {{ $value | humanizeDuration }}"
+          title: "Health readings are out of date"
+          summary: "The small script that writes this server's health readings (security, reboot and clock status) has not updated them for {{ $value | humanizeDuration }}."
+          impact: "The server is probably fine, but monitoring can no longer tell whether it is safe and up to date."
+          action: "On the server, run: systemctl status zecblock-host-textfile.timer, and restart it if it has stopped."
       - alert: HostTextfileMissing
         expr: up{job="node"} == 1 unless on (instance) zecblock_host_textfile_last_run_timestamp_seconds
         for: 15m
         labels: {severity: warning}
         annotations:
-          summary: "{{ $labels.host }} has no zecblock_host.prom (CVE/reboot/clock state unknown)"
+          title: "Health readings missing"
+          summary: "This server is up, but it has never written its health readings file."
+          impact: "Monitoring cannot see security, reboot or clock status for this server."
+          action: "The host health timer was probably not installed. Re-run the monitoring setup step for this host."
       - alert: HostTextfileScrapeError
         expr: node_textfile_scrape_error == 1
         for: 5m
         labels: {severity: warning}
         annotations:
-          summary: "{{ $labels.host }} node_exporter cannot parse a textfile"
+          title: "Health readings unreadable"
+          summary: "One of this server's health reading files is malformed, so monitoring cannot read it."
+          impact: "Some health checks for this server are blind until it is fixed."
+          action: "Look at the .prom files in /var/lib/prometheus/node-exporter on the server; a script probably wrote a bad line."
       - alert: DiskSpaceLow
         expr: >
           node_filesystem_avail_bytes{fstype!~"tmpfs|overlay|squashfs|ramfs",mountpoint!~"/boot.*|/snap.*"}
@@ -57,7 +72,10 @@ groups:
         for: 15m
         labels: {severity: warning}
         annotations:
-          summary: "{{ $labels.host }} {{ $labels.mountpoint }} has {{ $value | humanizePercentage }} free"
+          title: "Disk getting full"
+          summary: "{{ $labels.mountpoint }} has only {{ $value | humanizePercentage }} free space left."
+          impact: "If the disk fills up, the database, node or indexer will stop writing and the site can break."
+          action: "Free up space today: check large logs and old backups (du -sh /var/log /root/backups), or resize the disk."
       - alert: DiskSpaceCritical
         expr: >
           node_filesystem_avail_bytes{fstype!~"tmpfs|overlay|squashfs|ramfs",mountpoint!~"/boot.*|/snap.*"}
@@ -65,7 +83,10 @@ groups:
         for: 5m
         labels: {severity: critical}
         annotations:
-          summary: "{{ $labels.host }} {{ $labels.mountpoint }} has {{ $value | humanizePercentage }} free"
+          title: "Disk almost full"
+          summary: "{{ $labels.mountpoint }} has only {{ $value | humanizePercentage }} free space left."
+          impact: "Services will start failing very soon once the disk is completely full."
+          action: "Act now: delete old logs or backups, or add disk space at the provider."
       - alert: DiskFillsWithin24h
         expr: >
           predict_linear(node_filesystem_avail_bytes{fstype!~"tmpfs|overlay|squashfs|ramfs",mountpoint!~"/boot.*|/snap.*"}[6h], 86400) < 0
@@ -73,19 +94,27 @@ groups:
         for: 1h
         labels: {severity: warning}
         annotations:
-          summary: "{{ $labels.host }} {{ $labels.mountpoint }} projected full within 24h"
+          title: "Disk will be full within a day"
+          summary: "At the current rate, {{ $labels.mountpoint }} will run out of space in less than 24 hours."
+          impact: "When it fills up, services on this server will stop writing data."
+          action: "Find what is growing (du -sh /var/* | sort -h) and clean it up or add space today."
       - alert: MemoryLow
         expr: node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes < 0.05
         for: 10m
         labels: {severity: warning}
         annotations:
-          summary: "{{ $labels.host }} has {{ $value | humanizePercentage }} memory available"
+          title: "Running out of memory"
+          summary: "Only {{ $value | humanizePercentage }} of this server's memory is free."
+          impact: "The system may start killing programs (like the node or the API) to free memory."
+          action: "Check what is using memory (top or htop). Restarting the biggest service usually helps; if it keeps happening, the server needs more RAM."
       - alert: OomKill
         expr: increase(node_vmstat_oom_kill[30m]) > 0
         labels: {severity: warning}
         annotations:
-          title: "OOM kill"
-          summary: "{{ $labels.host }} kernel OOM-killed a process in the last 30m"
+          title: "A program was killed for using too much memory"
+          summary: "In the last 30 minutes the system ran out of memory and force-stopped a program."
+          impact: "Whatever was killed (often the node, indexer or API) may have restarted or may still be down."
+          action: "Check which service died: journalctl -k | grep -i oom, then make sure it is running again."
 
   - name: zecblock-security
     rules:
@@ -94,35 +123,47 @@ groups:
         for: 2m
         labels: {severity: critical}
         annotations:
-          title: "CVE-2026-98432 stopgap missing"
-          summary: "{{ $labels.host }} has no CVE-2026-98432 nft drop rule (table ip cve_2026_98432); host kernel is exposed"
+          title: "Security protection missing"
+          summary: "The firewall rule that protects this server from the CVE-2026-98432 Linux kernel bug is not in place."
+          impact: "Until it is back, a specially crafted network packet could crash or take over this server."
+          action: "Re-apply the protection now: run the observer/host hardening script again, then check with: nft list table ip cve_2026_98432."
       - alert: MptcpEnabled
         expr: zecblock_mptcp_enabled == 1
         for: 2m
         labels: {severity: critical}
         annotations:
-          title: "MPTCP enabled"
-          summary: "{{ $labels.host }} has net.mptcp.enabled=1"
+          title: "Risky network feature turned on"
+          summary: "MPTCP (a network feature we keep disabled for security) is switched on on this server."
+          impact: "It widens the attack surface for current kernel bugs."
+          action: "Turn it off: sysctl -w net.mptcp.enabled=0, and check /etc/sysctl.d still sets it to 0."
       - alert: Cve202698432PacketsDropped
         # Signal only: IPv4 TCP with IP options is rare in legitimate traffic.
         expr: increase(zecblock_cve_2026_98432_nft_dropped_packets_total[15m]) > 0
         labels: {severity: info}
         annotations:
-          title: "CVE-2026-98432 packets dropped"
-          summary: "{{ $labels.host }} dropped {{ $value | printf \"%.0f\" }} IPv4 TCP packets with IP options in 15m"
+          title: "Blocked suspicious network packets"
+          summary: "The security firewall blocked {{ $value | printf \"%.0f\" }} unusual packets (IPv4 TCP with IP options) in 15 minutes."
+          impact: "This is the protection working. It can be random internet noise or someone probing for the kernel bug."
+          action: "Nothing to do unless it keeps growing quickly."
       - alert: RebootPending
         expr: zecblock_reboot_required == 1 or zecblock_kernel_newer_installed == 1
         for: 1h
         labels: {severity: info}
         annotations:
-          summary: "{{ $labels.host }} needs a reboot (installed kernel/packages not active)"
+          title: "Restart needed to finish updates"
+          summary: "Security updates were installed but only take effect after a restart."
+          impact: "The server keeps running fine, but the new protections are not active yet."
+          action: "Observers restart themselves at 04:00 UTC. For production servers, pick a quiet moment to reboot."
       - alert: RebootPendingStale
         # Observers reboot automatically at 04:00; production hosts need an owner-approved reboot.
         # The since-timestamp exists only while /run/reboot-required exists.
         expr: time() - zecblock_reboot_required_since_timestamp_seconds > 3 * 86400
         labels: {severity: warning}
         annotations:
-          summary: "{{ $labels.host }} reboot pending for {{ $value | humanizeDuration }}"
+          title: "Restart overdue"
+          summary: "This server has been waiting {{ $value | humanizeDuration }} for a restart to finish installing updates."
+          impact: "Security fixes have been installed but are not protecting the server yet."
+          action: "Plan a reboot today. For the main server, check nothing important is running first."
 
   - name: zecblock-clock
     rules:
@@ -132,26 +173,38 @@ groups:
         for: 10m
         labels: {severity: warning}
         annotations:
-          summary: "{{ $labels.host }} chrony offset {{ $value | humanizeDuration }} (> 10 ms)"
+          title: "Server clock is off"
+          summary: "This server's clock is {{ $value | humanizeDuration }} away from real time (the limit is 10 ms)."
+          impact: "Block first-seen times compare clocks across servers, so a wrong clock can make the wrong observer look first."
+          action: "Check the time service: chronyc tracking. Restarting chrony usually fixes it."
       - alert: ClockUnsynchronised
         expr: zecblock_chrony_synchronised == 0
         for: 10m
         labels: {severity: warning}
         annotations:
-          summary: "{{ $labels.host }} chrony is not synchronised"
+          title: "Server clock not syncing"
+          summary: "The time service (chrony) on this server is not keeping the clock in sync."
+          impact: "The clock will slowly drift, which makes first-seen timings less accurate."
+          action: "Run chronyc sources to see if it can reach time servers; restart chrony if needed."
       - alert: ChronyDown
         # Only hosts where chrony answered in the last day (some hosts may use timesyncd).
         expr: zecblock_chrony_up == 0 and on (instance) max_over_time(zecblock_chrony_up[1d]) == 1
         for: 10m
         labels: {severity: warning}
         annotations:
-          summary: "{{ $labels.host }} chronyc tracking stopped answering"
+          title: "Time service stopped"
+          summary: "The time service (chrony) on this server stopped answering."
+          impact: "Without it the clock will drift and first-seen timings get less accurate."
+          action: "Restart it: systemctl restart chrony."
       - alert: KernelClockUnsynchronised
         expr: node_timex_sync_status == 0
         for: 15m
         labels: {severity: warning}
         annotations:
-          summary: "{{ $labels.host }} kernel reports the clock unsynchronised"
+          title: "Server clock not synced"
+          summary: "The system reports that its clock is not synchronised with real time."
+          impact: "Timestamps from this server may be slightly wrong."
+          action: "Check the time service (chronyc tracking or timedatectl) and restart it if needed."
 
   - name: zecblock-zakura
     rules:
@@ -160,13 +213,19 @@ groups:
         for: 5m
         labels: {severity: warning}
         annotations:
-          summary: "{{ $labels.host }} Zakura metrics endpoint unreachable"
+          title: "Zcash node not reporting"
+          summary: "Monitoring cannot read status from the Zakura (Zcash) node on this server."
+          impact: "The node may have stopped. If it is down, this server cannot follow the chain."
+          action: "Check the node: systemctl status zakurad, and restart it if it is not running."
       - alert: ZakuraTipBehind
         expr: zecblock:zakura_tip_lag_blocks > 3
         for: 10m
         labels: {severity: warning}
         annotations:
-          summary: "{{ $labels.host }} ({{ $labels.network }}) is {{ $value }} blocks behind the best fleet node"
+          title: "Zcash node is behind"
+          summary: "This node is {{ $value }} blocks behind the most up-to-date node in our fleet."
+          impact: "Data from this server is late. On the main server, the site will show older blocks."
+          action: "Usually it catches up by itself. If it lasts, check its peers and logs: journalctl -u zakurad."
       - alert: ZakuraTipStalled
         # ~75 s blocks: no height change in 45 m is ~e^-36 unlikely by chance.
         # The offset term requires 45 m of history, so a new node does not page at once.
@@ -176,13 +235,19 @@ groups:
         for: 5m
         labels: {severity: critical}
         annotations:
-          summary: "{{ $labels.host }} ({{ $labels.network }}) tip has not advanced for 45m"
+          title: "Zcash node stuck"
+          summary: "This node has not received a new block for 45 minutes (normally one comes every ~75 seconds)."
+          impact: "The node is stuck. On the main server, the explorer stops showing new blocks."
+          action: "Restart the node (systemctl restart zakurad) and watch its logs for errors."
       - alert: ZakuraFewPeers
         expr: zecblock:zakura_peers < 8
         for: 15m
         labels: {severity: warning}
         annotations:
-          summary: "{{ $labels.host }} has {{ $value }} Zakura peers"
+          title: "Zcash node has few connections"
+          summary: "This node is connected to only {{ $value }} other nodes (we want at least 8)."
+          impact: "With few connections it can fall behind or see blocks later than usual."
+          action: "Usually fixes itself. If not, check the firewall allows port 8233 and restart the node."
 
   - name: zecblock-capture
     rules:
@@ -191,68 +256,101 @@ groups:
         for: 3m
         labels: {severity: critical}
         annotations:
-          summary: "capture/census exporter for {{ $labels.network }} cannot query PostgreSQL"
+          title: "Orphan-tracking stats cannot reach the database"
+          summary: "The job that reads orphan-tracking stats cannot query the database."
+          impact: "We lose visibility of the observers and census. The website itself may still work."
+          action: "Check PostgreSQL on the main server is up, then the exporter: systemctl status zecblock-capture-exporter.timer."
       - alert: CaptureExporterMissing
         expr: up{job="node",host="primary"} == 1 unless on (instance) zecblock_capture_exporter_last_run_timestamp_seconds{network="mainnet"}
         for: 10m
         labels: {severity: warning}
         annotations:
-          summary: "primary has no zecblock_capture_mainnet.prom"
+          title: "Orphan-tracking stats not being written"
+          summary: "The main server is up but is not producing the orphan-tracking stats file."
+          impact: "Monitoring cannot see whether the observers are working."
+          action: "Check the exporter timer on the main server: systemctl status zecblock-capture-exporter.timer."
       - alert: CaptureObserverHeartbeatStale
         # Collector heartbeats every 15 s; acceptance bound is 45 s. Silence retired observers.
         expr: zecblock_capture_observer_heartbeat_age_seconds > 45
         for: 2m
         labels: {severity: critical}
         annotations:
-          summary: "observer {{ $labels.observer }} ({{ $labels.network }}) heartbeat {{ $value | humanizeDuration }} old"
+          title: "Observer went quiet"
+          summary: "This observer has not checked in for {{ $value | humanizeDuration }} (it normally checks in every 15 seconds)."
+          impact: "Competing blocks it would have seen are not being recorded. The other observers keep working."
+          action: "Check its collector: systemctl status cipherscan-orphan-collector (or the remote collector for partner nodes)."
       - alert: CaptureObserverStreamDisconnected
         expr: zecblock_capture_observer_stream_connected == 0
         for: 5m
         labels: {severity: critical}
         annotations:
-          summary: "observer {{ $labels.observer }} ({{ $labels.network }}) block stream disconnected"
+          title: "Observer lost its node connection"
+          summary: "This observer's live block feed from its node is disconnected."
+          impact: "It cannot see new or competing blocks until it reconnects."
+          action: "Usually reconnects by itself. If not, check that its node is running and reachable."
       - alert: CaptureNoHealthyObserver
         expr: max by (network) (zecblock:capture_observer_healthy) == 0
         for: 2m
         labels: {severity: critical}
         annotations:
-          summary: "no healthy orphan-capture observer on {{ $labels.network }}: competing blocks are not being captured"
+          title: "Orphan tracking has stopped"
+          summary: "None of our observers is working right now."
+          impact: "Competing (orphan) blocks are not being recorded at all, so orphan-rate numbers will have a gap."
+          action: "Check the main server's database and network first, then the observer collectors."
       - alert: CaptureObserverPendingRecords
         expr: zecblock_capture_observer_pending_records > 0
         for: 15m
         labels: {severity: warning}
         annotations:
-          summary: "observer {{ $labels.observer }} has {{ $value }} journal records not yet in PostgreSQL for 15m"
+          title: "Observer data not reaching the database"
+          summary: "This observer has {{ $value }} saved records it has not been able to send to the database for 15 minutes."
+          impact: "Nothing is lost yet (they are saved locally), but they are not counted on the site."
+          action: "Check the observer can reach the database over WireGuard (wg show) and that PostgreSQL accepts it."
       - alert: CaptureObserverJournalFilling
         expr: zecblock_capture_observer_pending_bytes / zecblock_capture_observer_journal_max_bytes > 0.5
         for: 5m
         labels: {severity: warning}
         annotations:
-          summary: "observer {{ $labels.observer }} journal {{ $value | humanizePercentage }} full"
+          title: "Observer backlog growing"
+          summary: "This observer's local backlog is {{ $value | humanizePercentage }} full because it cannot send data to the database."
+          impact: "If the backlog fills completely, new observations will be dropped."
+          action: "Fix the connection to the database today (WireGuard or PostgreSQL)."
       - alert: CaptureObserverJournalNearlyFull
         expr: zecblock_capture_observer_pending_bytes / zecblock_capture_observer_journal_max_bytes > 0.9
         for: 2m
         labels: {severity: critical}
         annotations:
-          summary: "observer {{ $labels.observer }} journal {{ $value | humanizePercentage }} full; captures will be lost"
+          title: "Observer about to lose data"
+          summary: "This observer's local backlog is {{ $value | humanizePercentage }} full."
+          impact: "Very soon new observations will be dropped and lost for good."
+          action: "Fix the observer's database connection now (WireGuard or PostgreSQL)."
       - alert: CaptureObserverGaps
         expr: increase(zecblock_capture_observer_gaps_total[1h]) > 0
         labels: {severity: warning}
         annotations:
-          summary: "observer {{ $labels.observer }} recorded {{ $value | printf \"%.0f\" }} stream gaps in 1h"
+          title: "Observer missed part of the block feed"
+          summary: "This observer had {{ $value | printf \"%.0f\" }} gaps in its block feed in the last hour."
+          impact: "Some blocks may have been missed by this observer. Other observers usually cover it."
+          action: "Nothing urgent. If it repeats, check the node's logs and network on that observer."
       - alert: CaptureObserverNoRecentReceipts
         # initial: ~16 blocks expected in 20 m.
         expr: zecblock_capture_observer_last_receipt_age_seconds > 1200 and on (network, observer) zecblock_capture_observer_heartbeat_age_seconds < 45
         for: 5m
         labels: {severity: warning}
         annotations:
-          summary: "observer {{ $labels.observer }} is alive but wrote no receipt for {{ $value | humanizeDuration }}"
+          title: "Observer is not recording blocks"
+          summary: "This observer is running but has not recorded a block for {{ $value | humanizeDuration }} (about 16 are expected in 20 minutes)."
+          impact: "It is probably stuck and not contributing to orphan tracking."
+          action: "Restart its collector and check its node is in sync."
       - alert: CaptureCoverageColumnsMissing
         expr: zecblock_capture_schema_present{object="migration_042_coverage"} == 0
         for: 10m
         labels: {severity: warning}
         annotations:
-          summary: "{{ $labels.network }} database lacks migration 042 coverage columns"
+          title: "Database update not applied"
+          summary: "The database is missing the coverage columns from migration 042."
+          impact: "Observer coverage times cannot be stored."
+          action: "Apply migration 042 on this network's database."
       - alert: CaptureObserverCoverageUntimed
         # 042 present but this observer never wrote coverage_since: it runs a pre-042 collector.
         expr: >
@@ -262,32 +360,47 @@ groups:
         for: 30m
         labels: {severity: warning}
         annotations:
-          summary: "observer {{ $labels.observer }} is not writing migration 042 timed coverage"
+          title: "Observer running old software"
+          summary: "This observer is not writing coverage times, which means it runs an older collector version."
+          impact: "Its coverage is not counted precisely."
+          action: "Update the collector on this observer to the current release."
       - alert: CaptureAuditStale
         # Default audit interval is 300 s.
         expr: zecblock_capture_observer_audit_age_seconds > 900 and on (network, observer) zecblock_capture_observer_heartbeat_age_seconds < 45
         for: 5m
         labels: {severity: warning}
         annotations:
-          summary: "observer {{ $labels.observer }} coverage audit last ran {{ $value | humanizeDuration }} ago"
+          title: "Observer self-check not running"
+          summary: "This observer's coverage self-check last ran {{ $value | humanizeDuration }} ago (it should run every 5 minutes)."
+          impact: "We cannot confirm this observer is catching every block."
+          action: "Restart its collector."
       - alert: CaptureAuditFailing
         expr: zecblock_capture_observer_audit_ok == 0
         for: 15m
         labels: {severity: warning}
         annotations:
-          summary: "observer {{ $labels.observer }} coverage audit is failing (see audit_status)"
+          title: "Observer self-check failing"
+          summary: "This observer's coverage self-check keeps failing."
+          impact: "We cannot confirm this observer is catching every block."
+          action: "Look at the collector logs on that observer (journalctl -u the collector) for the error."
       - alert: CaptureCanonicalBlocksMissing
         expr: zecblock_capture_observer_audit_canonical_missing > 0
         for: 10m
         labels: {severity: critical}
         annotations:
-          summary: "observer {{ $labels.observer }}: {{ $value }} recent canonical blocks missing from captured_blocks"
+          title: "Observer missed real blocks"
+          summary: "This observer is missing {{ $value }} recent blocks that are on the main chain."
+          impact: "Its recording is incomplete, so it may also be missing competing blocks."
+          action: "Restart its collector and check its node is in sync."
       - alert: CaptureAuditMissesOpen
         expr: zecblock_capture_observer_audit_misses_open > 0
         for: 30m
         labels: {severity: warning}
         annotations:
-          summary: "observer {{ $labels.observer }} has {{ $value }} fork blocks the node validated but the collector never captured"
+          title: "Observer missed competing blocks"
+          summary: "This observer's node saw {{ $value }} competing blocks that the collector did not record."
+          impact: "Those orphans are missing from this observer's data (other observers may still have them)."
+          action: "Check the collector logs on that observer; a restart usually helps."
 
   - name: zecblock-census
     rules:
@@ -297,20 +410,29 @@ groups:
         for: 5m
         labels: {severity: warning}
         annotations:
-          summary: "census gossip from {{ $labels.collector_source }} is {{ $value | humanizeDuration }} old"
+          title: "Node map data is old"
+          summary: "The node-map crawler has not sent new data for {{ $value | humanizeDuration }}."
+          impact: "The node map on the website will slowly go stale."
+          action: "Check the crawler service on that server is running."
       - alert: CensusGossipTruncated
         expr: zecblock_census_gossip_truncated == 1
         for: 1h
         labels: {severity: info}
         annotations:
-          summary: "census gossip snapshot from {{ $labels.collector_source }} is truncated at the edge cap"
+          title: "Node map data was cut short"
+          summary: "The latest node-map crawl hit its size limit, so part of it was left out."
+          impact: "The node map may be slightly incomplete."
+          action: "Nothing to do now; the limit may need raising if this stays on."
       - alert: CensusSnapshotStale
         # initial; census v3 is the current published version.
         expr: zecblock_census_snapshot_age_seconds{census_version="3"} > 7200
         for: 10m
         labels: {severity: warning}
         annotations:
-          summary: "newest census v3 snapshot on {{ $labels.network }} is {{ $value | humanizeDuration }} old"
+          title: "Node map not updated"
+          summary: "The newest node-map snapshot is {{ $value | humanizeDuration }} old (it should update at least every 2 hours)."
+          impact: "The node map and node counts on the website are out of date."
+          action: "Check the census job on the main server."
       - alert: CensusSnapshotMissing
         expr: >
           zecblock_capture_schema_present{object="node_snapshots"} == 1
@@ -318,7 +440,10 @@ groups:
         for: 30m
         labels: {severity: warning}
         annotations:
-          summary: "no census v3 snapshot on {{ $labels.network }} in 7 days"
+          title: "Node map has no recent data"
+          summary: "There has been no node-map snapshot in the last 7 days."
+          impact: "The node map on the website has no current data."
+          action: "Check the census job on the main server and its logs."
 
   - name: zecblock-host-health-checks
     # Metrics written by the per-host health scripts (check-indexer-health.sh,
@@ -331,8 +456,10 @@ groups:
         for: 5m
         labels: {severity: critical}
         annotations:
-          title: "Indexer unhealthy"
-          summary: "{{ $labels.host }} indexer health check failing: {{ $labels.reasons }}"
+          title: "Indexer having problems"
+          summary: "The indexer (which copies the blockchain into our database) is failing its health check: {{ $labels.reasons }}."
+          impact: "New blocks and transactions may not appear on the website."
+          action: "Check its logs: journalctl -u cipherscan-indexer -n 100. A restart often fixes it."
       - alert: IndexerHealthCheckStale
         # The health timer runs every 5 minutes.
         expr: time() - zecblock_indexer_health_last_run_timestamp_seconds > 1200
@@ -340,28 +467,36 @@ groups:
         labels: {severity: warning}
         annotations:
           title: "Indexer health check not running"
-          summary: "{{ $labels.host }} has not run the indexer health check for {{ $value | humanizeDuration }}"
+          summary: "The indexer health check has not run for {{ $value | humanizeDuration }} (it should run every 5 minutes)."
+          impact: "If the indexer breaks, nobody will be told."
+          action: "Check its timer: systemctl status check-indexer-health.timer."
       - alert: OpsCheckFailing
         expr: zecblock_ops_check_ok{check=~"node_sync|redis|pg_pool|api_realtime"} == 0
         for: 5m
         labels: {severity: critical}
         annotations:
           title: "{{ $labels.name }} check failing"
-          summary: "{{ $labels.host }}: {{ $labels.name }} check is failing"
+          summary: "The {{ $labels.name }} check on this server is failing."
+          impact: "Part of the website or API may be broken or slow."
+          action: "Look at the ops health output on the server for the details: journalctl -u check-ops-health -n 50."
       - alert: OpsCheckDegraded
         expr: zecblock_ops_check_ok{check=~"backup|wal|replication|replica"} == 0
         for: 10m
         labels: {severity: warning}
         annotations:
           title: "{{ $labels.name }} check failing"
-          summary: "{{ $labels.host }}: {{ $labels.name }} check is failing"
+          summary: "The {{ $labels.name }} check on this server is failing."
+          impact: "The site still works, but a safety net (backups or replication) is not doing its job."
+          action: "Look at it today: journalctl -u check-ops-health -n 50 shows the reason."
       - alert: OpsHealthCheckStale
         expr: time() - zecblock_ops_health_last_run_timestamp_seconds > 1200
         for: 5m
         labels: {severity: warning}
         annotations:
           title: "Ops health check not running"
-          summary: "{{ $labels.host }} has not run the ops health check for {{ $value | humanizeDuration }}"
+          summary: "The ops health check has not run for {{ $value | humanizeDuration }} (it should run every 5 minutes)."
+          impact: "If something breaks on this server, nobody will be told."
+          action: "Check its timer: systemctl status check-ops-health.timer."
 
   - name: zecblock-monitoring
     rules:
@@ -376,9 +511,15 @@ groups:
         expr: increase(prometheus_rule_evaluation_failures_total[10m]) > 0
         labels: {severity: warning}
         annotations:
-          summary: "Prometheus rule evaluation failures in {{ $labels.rule_group }}"
+          title: "Monitoring has a broken rule"
+          summary: "Monitoring could not evaluate some of its rules (group {{ $labels.rule_group }})."
+          impact: "Some alerts may not fire when they should."
+          action: "Check Prometheus logs on the monitoring server: journalctl -u prometheus -n 50."
       - alert: AlertmanagerNotificationsFailing
         expr: increase(alertmanager_notifications_failed_total[15m]) > 0
         labels: {severity: critical}
         annotations:
-          summary: "Alertmanager failed to deliver {{ $value | printf \"%.0f\" }} {{ $labels.integration }} notifications in 15m"
+          title: "Alerts failing to send"
+          summary: "{{ $value | printf \"%.0f\" }} {{ $labels.integration }} notifications failed to send in 15 minutes."
+          impact: "You may be missing other alerts right now."
+          action: "Check the Telegram bot token and chat on the monitoring server: journalctl -u alertmanager -n 50."

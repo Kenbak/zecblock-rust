@@ -1,4 +1,9 @@
-🟠 <b>Capture observer heartbeat stale</b>
-• do-sgp1 heartbeat is 95s old
-• do-syd1 heartbeat is 95s old
-since 20:40 UTC
+🟠 <b>Observer went quiet</b>
+📍 2 places affected
+• Singapore observer: This observer has not checked in for 1m 35s (it normally checks in every 15 seconds).
+• Sydney observer: This observer has not checked in for 1m 35s (it normally checks in every 15 seconds).
+
+<b>Why it matters:</b> Competing blocks it would have seen are not being recorded. The other observers keep working.
+<b>What to do:</b> Check its collector: systemctl status cipherscan-orphan-collector (or the remote collector for partner nodes).
+
+<i>Look at it today · started 20:40 UTC</i>

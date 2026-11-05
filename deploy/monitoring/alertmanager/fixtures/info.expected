@@ -1,4 +1,4 @@
-🔵 <b>FYI</b> · 2 open, 1 cleared
-• Reboot pending · do-nyc3: do-nyc3 needs a reboot for a new kernel
-• Reboot pending · primary: primary needs a reboot for a new kernel
-✅ CVE-2026-98432 packets dropped · do-sgp1 cleared
+ℹ️ <b>For your information</b> · nothing urgent
+• <b>Restart needed to finish updates</b> · New York observer: Security updates were installed but only take effect after a restart. Observers restart themselves at 04:00 UTC. For production servers, pick a quiet moment to reboot.
+• <b>Restart needed to finish updates</b> · Main server (primary): Security updates were installed but only take effect after a restart. Observers restart themselves at 04:00 UTC. For production servers, pick a quiet moment to reboot.
+✅ Blocked suspicious network packets · Singapore observer: cleared

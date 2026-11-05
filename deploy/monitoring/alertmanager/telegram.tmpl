@@ -1,64 +1,124 @@
 {{/*
-  ZecBlock fleet alerts for Telegram (HTML parse mode).
-  Privacy: only alert names, host/network labels, summaries and times. No URLs
+  ZecBlock fleet alerts for Telegram (HTML parse mode), written for a
+  non-specialist reader: what is happening, why it matters, what to do.
+  Privacy: only alert text, friendly host/observer names and times. No URLs
   to private hosts, no IPs, no secrets. Times are UTC.
 
-  Firing:    🔴 Host down · primary
-             • primary is not answering metrics scrapes
-             since 20:31 UTC
-  Resolved:  ✅ Resolved · Host down · primary
-             20:31 → 20:43 UTC (12m)
-  Info (silent batch): 🔵 FYI · 3 open, one line each.
+  Firing:
+    🔴 Server not responding
+    📍 Main server (primary)
+
+    What's happening: Monitoring has not been able to reach this server for 3 minutes.
+    Why it matters: …
+    What to do: …
+
+    Urgent, look now · started 20:31 UTC
+  Resolved:
+    ✅ Fixed: Server not responding
+    📍 Main server (primary)
+    Back to normal after 12m (20:31 → 20:43 UTC). Nothing to do.
+  Info (one silent batch): ℹ️ For your information · nothing urgent, one line each.
+
+  Rules provide annotations title, summary, impact and action; a rule with
+  only summary still renders (its alert name becomes the title).
 */}}
 
-{{/* "HostDown" -> "Host down". Rules may set annotation `title` for acronyms (CVE, MPTCP, OOM). */}}
+{{/* "HostDown" -> "Host down", used only when a rule has no title. */}}
 {{ define "zecblock.title" -}}
 {{ $spaced := reReplaceAll "([a-z])([A-Z0-9])" "$1 $2" . -}}
 {{ $spaced = reReplaceAll "([0-9])([A-Z])" "$1 $2" $spaced -}}
 {{ reReplaceAll "^(.).*$" "$1" $spaced }}{{ reReplaceAll "^.(.*)$" "$1" $spaced | toLower }}
 {{- end }}
 
-{{ define "zecblock.icon" -}}
-{{ if eq .Status "resolved" }}✅{{ else if eq .CommonLabels.severity "critical" }}🔴{{ else if eq .CommonLabels.severity "warning" }}🟠{{ else }}🔵{{ end }}
+{{ define "zecblock.alert_title" -}}
+{{ if .Annotations.title }}{{ .Annotations.title | html }}{{ else }}{{ template "zecblock.title" .Labels.alertname }}{{ end }}
 {{- end }}
 
-{{/* Where: labels shared by every alert in the group; mainnet is implied. */}}
+{{/* Friendly names for our own fleet; anything else is shown as-is. */}}
+{{ define "zecblock.hostname" -}}
+{{ if eq . "primary" }}Main server{{ else if eq . "standby" }}Standby server{{ else if eq . "testnet" }}Testnet server
+{{- else if eq . "analytics" }}Analytics server{{ else if eq . "crosslink" }}Crosslink server{{ else if eq . "monitor" }}Monitoring server
+{{- else if eq . "cipherpay-mainnet" }}CipherPay server{{ else if eq . "cipherpay-testnet" }}CipherPay testnet server
+{{- else if eq . "do-nyc3" }}New York observer{{ else if eq . "do-sgp1" }}Singapore observer{{ else if eq . "do-syd1" }}Sydney observer
+{{- else if eq . "local-node" }}Helsinki observer (main server)
+{{- else if eq (reReplaceAll "^ext-zcashpools-.*$" "" .) "" }}zecminingpool.com node ({{ reReplaceAll "^ext-zcashpools-" "" . | html }})
+{{- else }}{{ . | html }}{{ end }}
+{{- end }}
+
+{{/* Location from an alert's labels: host, else observer, else census source; non-mainnet network appended. */}}
 {{ define "zecblock.where" -}}
-{{ if .CommonLabels.host }} · {{ .CommonLabels.host | html }}{{ end -}}
-{{ if .CommonLabels.observer }} · {{ .CommonLabels.observer | html }}{{ end -}}
-{{ if .CommonLabels.collector_source }} · {{ .CommonLabels.collector_source | html }}{{ end -}}
-{{ if and .CommonLabels.network (ne .CommonLabels.network "mainnet") (ne .CommonLabels.network .CommonLabels.host) }} · {{ .CommonLabels.network | html }}{{ end -}}
+{{ $raw := "" -}}
+{{ if .host }}{{ $raw = .host }}{{ else if .observer }}{{ $raw = .observer }}{{ else if .collector_source }}{{ $raw = .collector_source }}{{ end -}}
+{{ if $raw }}{{ template "zecblock.hostname" $raw }}{{ if and .host (eq (reReplaceAll "^(primary|standby|testnet|analytics|crosslink|monitor|cipherpay-mainnet|cipherpay-testnet)$" "" $raw) "") }} ({{ $raw | html }}){{ end }}{{ if and .host .observer }} · {{ template "zecblock.hostname" .observer }}{{ end }}{{ end -}}
+{{ if and .network (ne .network "mainnet") (ne .network .host) }}{{ if $raw }} · {{ end }}{{ .network | html }}{{ end -}}
+{{- end }}
+
+{{ define "zecblock.urgency" -}}
+{{ if eq . "critical" }}Urgent, look now{{ else if eq . "warning" }}Look at it today{{ else }}For information{{ end }}
+{{- end }}
+
+{{ define "zecblock.icon" -}}
+{{ if eq .CommonLabels.severity "critical" }}🔴{{ else if eq .CommonLabels.severity "warning" }}🟠{{ else }}ℹ️{{ end }}
 {{- end }}
 
 {{ define "zecblock.span" -}}
-{{ .StartsAt | tz "UTC" | date "15:04" }} → {{ .EndsAt | tz "UTC" | date "15:04" }} UTC ({{ (.EndsAt.Sub .StartsAt).Seconds | humanizeDuration }})
+{{ (.EndsAt.Sub .StartsAt).Seconds | humanizeDuration }} ({{ .StartsAt | tz "UTC" | date "15:04" }} → {{ .EndsAt | tz "UTC" | date "15:04" }} UTC)
 {{- end }}
 
 {{ define "zecblock.telegram.message" -}}
 {{ if eq .CommonLabels.severity "info" -}}
 {{ template "zecblock.telegram.digest" . }}
 {{- else if eq .Status "resolved" -}}
-{{ template "zecblock.icon" . }} <b>Resolved · {{ if .CommonAnnotations.title }}{{ .CommonAnnotations.title | html }}{{ else }}{{ template "zecblock.title" .CommonLabels.alertname }}{{ end }}</b>{{ template "zecblock.where" . }}
-{{ range $i, $a := .Alerts.Resolved }}{{ if lt $i 5 }}{{ if gt (len $.Alerts.Resolved) 1 }}• {{ $a.Annotations.summary | html }}: {{ end }}{{ template "zecblock.span" $a }}
-{{ end }}{{ end -}}
-{{ if gt (len .Alerts.Resolved) 5 }}… {{ len .Alerts.Resolved }} resolved in total{{ end }}
+{{ template "zecblock.telegram.resolved" . }}
 {{- else -}}
-{{ template "zecblock.icon" . }} <b>{{ if .CommonAnnotations.title }}{{ .CommonAnnotations.title | html }}{{ else }}{{ template "zecblock.title" .CommonLabels.alertname }}{{ end }}</b>{{ template "zecblock.where" . }}
-{{ range $i, $a := .Alerts.Firing }}{{ if lt $i 5 }}• {{ $a.Annotations.summary | html }}
-{{ end }}{{ end -}}
-{{ if gt (len .Alerts.Firing) 5 }}… {{ len .Alerts.Firing }} alerts in total
-{{ end -}}
-since {{ (index .Alerts.Firing 0).StartsAt | tz "UTC" | date "15:04" }} UTC{{ if .Alerts.Resolved }} · {{ len .Alerts.Resolved }} already resolved{{ end }}
+{{ template "zecblock.telegram.firing" . }}
 {{- end }}
 {{- end }}
 
-{{/* Info alerts: one silent batch, one line each. */}}
+{{ define "zecblock.telegram.firing" -}}
+{{ $first := index .Alerts.Firing 0 -}}
+{{ template "zecblock.icon" . }} <b>{{ template "zecblock.alert_title" $first }}</b>
+{{ if eq (len .Alerts.Firing) 1 -}}
+{{ with $first.Labels }}{{ if or .host .observer .collector_source (and .network (ne .network "mainnet")) }}📍 {{ template "zecblock.where" . }}
+{{ end }}{{ end }}
+<b>What's happening:</b> {{ $first.Annotations.summary | html }}
+{{- else -}}
+📍 {{ len .Alerts.Firing }} places affected
+{{ range $i, $a := .Alerts.Firing }}{{ if lt $i 6 }}• {{ template "zecblock.where" $a.Labels }}: {{ $a.Annotations.summary | html }}
+{{ end }}{{ end -}}
+{{ if gt (len .Alerts.Firing) 6 }}… {{ len .Alerts.Firing }} in total
+{{ end -}}
+{{- end }}
+{{ if $first.Annotations.impact }}<b>Why it matters:</b> {{ $first.Annotations.impact | html }}
+{{ end -}}
+{{ if $first.Annotations.action }}<b>What to do:</b> {{ $first.Annotations.action | html }}
+{{ end }}
+<i>{{ template "zecblock.urgency" .CommonLabels.severity }} · started {{ $first.StartsAt | tz "UTC" | date "15:04" }} UTC{{ if .Alerts.Resolved }} · {{ len .Alerts.Resolved }} already fixed{{ end }}</i>
+{{- end }}
+
+{{ define "zecblock.telegram.resolved" -}}
+{{ $first := index .Alerts.Resolved 0 -}}
+✅ <b>Fixed: {{ template "zecblock.alert_title" $first }}</b>
+{{ if eq (len .Alerts.Resolved) 1 -}}
+{{ with $first.Labels }}{{ if or .host .observer .collector_source (and .network (ne .network "mainnet")) }}📍 {{ template "zecblock.where" . }}
+{{ end }}{{ end -}}
+Back to normal after {{ template "zecblock.span" $first }}. Nothing to do.
+{{- else -}}
+{{ range $i, $a := .Alerts.Resolved }}{{ if lt $i 6 }}• {{ template "zecblock.where" $a.Labels }}: back after {{ template "zecblock.span" $a }}
+{{ end }}{{ end -}}
+{{ if gt (len .Alerts.Resolved) 6 }}… {{ len .Alerts.Resolved }} fixed in total
+{{ end -}}
+Nothing to do.
+{{- end }}
+{{- end }}
+
+{{/* Info alerts: one silent batch, one plain line each. */}}
 {{ define "zecblock.telegram.digest" -}}
-🔵 <b>FYI</b> · {{ len .Alerts.Firing }} open{{ if .Alerts.Resolved }}, {{ len .Alerts.Resolved }} cleared{{ end }}
-{{ range $i, $a := .Alerts.Firing }}{{ if lt $i 10 }}• {{ if $a.Annotations.title }}{{ $a.Annotations.title | html }}{{ else }}{{ template "zecblock.title" $a.Labels.alertname }}{{ end }}{{ if $a.Labels.host }} · {{ $a.Labels.host | html }}{{ end }}: {{ $a.Annotations.summary | html }}
+ℹ️ <b>For your information</b> · nothing urgent
+{{ range $i, $a := .Alerts.Firing }}{{ if lt $i 10 }}• <b>{{ template "zecblock.alert_title" $a }}</b>{{ if or $a.Labels.host $a.Labels.observer $a.Labels.collector_source }} · {{ template "zecblock.where" $a.Labels }}{{ end }}: {{ $a.Annotations.summary | html }}{{ if $a.Annotations.action }} {{ $a.Annotations.action | html }}{{ end }}
 {{ end }}{{ end -}}
 {{ if gt (len .Alerts.Firing) 10 }}… {{ len .Alerts.Firing }} in total
 {{ end -}}
-{{ range .Alerts.Resolved }}✅ {{ if .Annotations.title }}{{ .Annotations.title | html }}{{ else }}{{ template "zecblock.title" .Labels.alertname }}{{ end }}{{ if .Labels.host }} · {{ .Labels.host | html }}{{ end }} cleared
+{{ range .Alerts.Resolved }}✅ {{ template "zecblock.alert_title" . }}{{ if or .Labels.host .Labels.observer }} · {{ template "zecblock.where" .Labels }}{{ end }}: cleared
 {{ end -}}
 {{- end }}

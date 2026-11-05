@@ -1,3 +1,8 @@
-🔴 <b>Host down</b> · primary
-• primary is not answering metrics scrapes
-since 20:31 UTC
+🔴 <b>Server not responding</b>
+📍 Main server (primary)
+
+<b>What's happening:</b> Monitoring has not been able to reach this server for 3 minutes.
+<b>Why it matters:</b> If this is the main server, the website and API are probably down. If it is an observer, orphan tracking just has one fewer vantage point.
+<b>What to do:</b> Try to SSH in. If it does not answer, open the provider console (Hetzner or DigitalOcean) and check whether it is running; a reboot from there usually brings it back.
+
+<i>Urgent, look now · started 20:31 UTC</i>
