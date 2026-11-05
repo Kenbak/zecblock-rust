@@ -39,7 +39,9 @@ groups:
           impact: "If this is the main server, the website and API are probably down. If it is an observer, orphan tracking just has one fewer vantage point."
           action: "Try to SSH in. If it does not answer, open the provider console (Hetzner or DigitalOcean) and check whether it is running; a reboot from there usually brings it back."
       - alert: HostTextfileStale
-        expr: time() - node_textfile_mtime_seconds{file=~".*zecblock_.*\\.prom"} > 300
+        # Per-minute host readings. The ops (10 min) and indexer (5 min) health files
+        # have their own *HealthCheckStale alerts with a 20 min limit.
+        expr: time() - node_textfile_mtime_seconds{file=~".*zecblock_.*\\.prom",file!~".*zecblock_(ops|indexer)_health\\.prom"} > 300
         for: 5m
         labels: {severity: warning}
         annotations:

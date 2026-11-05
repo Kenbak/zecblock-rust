@@ -48,8 +48,9 @@
 {{/* Location from an alert's labels: host, else observer, else census source; non-mainnet network appended. */}}
 {{ define "zecblock.where" -}}
 {{ $raw := "" -}}
-{{ if .host }}{{ $raw = .host }}{{ else if .observer }}{{ $raw = .observer }}{{ else if .collector_source }}{{ $raw = .collector_source }}{{ end -}}
-{{ if $raw }}{{ template "zecblock.hostname" $raw }}{{ if and .host (eq (reReplaceAll "^(primary|standby|testnet|analytics|crosslink|monitor|cipherpay-mainnet|cipherpay-testnet)$" "" $raw) "") }} ({{ $raw | html }}){{ end }}{{ if and .host .observer }} · {{ template "zecblock.hostname" .observer }}{{ end }}{{ end -}}
+{{/* An observer label wins: capture metrics are exported from the primary, so their host label is only where the exporter runs. */ -}}
+{{ if .observer }}{{ $raw = .observer }}{{ else if .collector_source }}{{ $raw = .collector_source }}{{ else if .host }}{{ $raw = .host }}{{ end -}}
+{{ if $raw }}{{ template "zecblock.hostname" $raw }}{{ if and (not .observer) (not .collector_source) (eq (reReplaceAll "^(primary|standby|testnet|analytics|crosslink|monitor|cipherpay-mainnet|cipherpay-testnet)$" "" $raw) "") }} ({{ $raw | html }}){{ end }}{{ end -}}
 {{ if and .network (ne .network "mainnet") (ne .network .host) }}{{ if $raw }} · {{ end }}{{ .network | html }}{{ end -}}
 {{- end }}
 

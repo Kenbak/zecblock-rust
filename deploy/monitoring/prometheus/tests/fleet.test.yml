@@ -266,3 +266,14 @@ tests:
               summary: "This observer's live block feed was interrupted in 3 separate 10-minute periods in the last hour."
               impact: "It reconnects by itself each time, but while it keeps dropping it may miss competing blocks. Other observers usually cover them."
               action: "For a zecminingpool.com node, ask its operator whether the node is restarting or overloaded. For our own observers, check the node and collector logs."
+
+  - name: ops health textfile on a 10-minute timer is not reported as stale host readings
+    interval: 1m
+    input_series:
+      - series: 'node_textfile_mtime_seconds{host="primary",file="/var/lib/prometheus/node-exporter/zecblock_ops_health.prom"}'
+        values: '0x20'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: HostTextfileStale
+        exp_alerts: []
+
