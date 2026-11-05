@@ -1,3 +1,8 @@
-🟠 <b>Zakura tip behind</b> · testnet
-• testnet (testnet) is 12 blocks behind the best fleet node
-since 21:05 UTC
+🟠 <b>Zcash node is behind</b>
+📍 Testnet server (testnet)
+
+<b>What's happening:</b> This node is 12 blocks behind the most up-to-date node in our fleet.
+<b>Why it matters:</b> Data from this server is late. On the main server, the site will show older blocks.
+<b>What to do:</b> Usually it catches up by itself. If it lasts, check its peers and logs: journalctl -u zakurad.
+
+<i>Look at it today · started 21:05 UTC</i>
