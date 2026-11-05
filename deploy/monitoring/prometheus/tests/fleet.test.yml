@@ -126,8 +126,10 @@ tests:
   - name: zakura tip lag and stall
     interval: 1m
     input_series:
+      # The primary holds 3100015 until 20m so the 15m lag is exactly 25 whichever
+      # sample the recording rule last saw, then advances (so it never stalls).
       - series: 'state_full_verifier_committed_block_height{job="zakura",instance="10.77.0.1:9999",host="primary",network="mainnet"}'
-        values: '3100000+1x60'
+        values: '3100015x20 3100016+1x40'
       - series: 'state_full_verifier_committed_block_height{job="zakura",instance="10.77.0.2:9999",host="do-nyc3",network="mainnet"}'
         values: '3099990x60'
     alert_rule_test:
