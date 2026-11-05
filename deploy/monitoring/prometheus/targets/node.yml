@@ -1,6 +1,6 @@
 # node_exporter targets, scraped over WireGuard (10.77.0.0/24) only.
 #
-# WireGuard addresses below are the PROPOSED monitoring address plan
+# WireGuard addresses follow the monitoring address plan
 # (README "Address plan"). Only 10.77.0.1 (primary hub) is fixed by the
 # observer kit. A host is added here only after its WireGuard peer to the
 # monitor (10.77.0.10) is up and node_exporter listens on its wg address.
@@ -9,22 +9,22 @@
 #
 # Labels: host = stable fleet name (never reused), role, provider, region.
 # No public IPs here: instance is the WireGuard address.
-- targets: ['10.77.0.1:9100']
-  labels: {host: primary, role: mainnet-primary, provider: hetzner, region: hel1}
-- targets: ['10.77.0.20:9100']
-  labels: {host: standby, role: mainnet-standby, provider: hetzner, region: hel1}
-- targets: ['10.77.0.21:9100']
-  labels: {host: testnet, role: testnet, provider: hetzner, region: hel1}
-- targets: ['10.77.0.22:9100']
-  labels: {host: analytics, role: analytics, provider: hetzner, region: hel1}
-- targets: ['10.77.0.23:9100']
-  labels: {host: crosslink, role: crosslink, provider: digitalocean, region: unknown}
-- targets: ['10.77.0.24:9100']
-  labels: {host: cipherpay-mainnet, role: cipherpay, provider: digitalocean, region: unknown}
-- targets: ['10.77.0.25:9100']
-  labels: {host: cipherpay-testnet, role: cipherpay, provider: digitalocean, region: unknown}
-- targets: ['10.77.0.26:9100']
-  labels: {host: shopify, role: cipherpay, provider: digitalocean, region: unknown}
+#- targets: ['10.77.0.1:9100']
+#  labels: {host: primary, role: mainnet-primary, provider: hetzner, region: hel1}
+#- targets: ['10.77.0.20:9100']
+#  labels: {host: standby, role: mainnet-standby, provider: hetzner, region: hel1}
+#- targets: ['10.77.0.21:9100']
+#  labels: {host: testnet, role: testnet, provider: hetzner, region: hel1}
+#- targets: ['10.77.0.22:9100']
+#  labels: {host: analytics, role: analytics, provider: hetzner, region: hel1}
+#- targets: ['10.77.0.23:9100']
+#  labels: {host: crosslink, role: crosslink, provider: digitalocean, region: unknown}
+#- targets: ['10.77.0.24:9100']
+#  labels: {host: cipherpay-mainnet, role: cipherpay, provider: digitalocean, region: unknown}
+#- targets: ['10.77.0.25:9100']
+#  labels: {host: cipherpay-testnet, role: cipherpay, provider: digitalocean, region: unknown}
+#- targets: ['10.77.0.26:9100']
+#  labels: {host: shopify, role: cipherpay, provider: digitalocean, region: unknown}
 - targets: ['10.77.0.2:9100']
   labels: {host: do-nyc3, role: observer, provider: digitalocean, region: nyc3}
 - targets: ['10.77.0.3:9100']
