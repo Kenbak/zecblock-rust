@@ -171,3 +171,40 @@ tests:
           - exp_labels: {severity: none}
             exp_annotations:
               summary: "monitoring pipeline heartbeat"
+
+  - name: host health check scripts
+    interval: 1m
+    input_series:
+      - series: 'zecblock_indexer_healthy{instance="10.77.0.1:9100",host="primary",reasons="ingest_stalled,lag_exceeded"}'
+        values: '0x15'
+      - series: 'zecblock_ops_check_ok{instance="10.77.0.1:9100",host="primary",check="pg_pool",name="PostgreSQL pool"}'
+        values: '0x15'
+      - series: 'zecblock_ops_check_ok{instance="10.77.0.1:9100",host="primary",check="disk",name="Disk"}'
+        values: '0x15'
+      - series: 'zecblock_ops_check_ok{instance="10.77.0.1:9100",host="primary",check="backup",name="Backup"}'
+        values: '0x15'
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: IndexerUnhealthy
+        exp_alerts:
+          - exp_labels: {severity: critical, instance: "10.77.0.1:9100", host: primary, reasons: "ingest_stalled,lag_exceeded"}
+            exp_annotations:
+              title: "Indexer unhealthy"
+              summary: "primary indexer health check failing: ingest_stalled,lag_exceeded"
+      - eval_time: 6m
+        alertname: OpsCheckFailing
+        exp_alerts:
+          - exp_labels: {severity: critical, instance: "10.77.0.1:9100", host: primary, check: pg_pool, name: "PostgreSQL pool"}
+            exp_annotations:
+              title: "PostgreSQL pool check failing"
+              summary: "primary: PostgreSQL pool check is failing"
+      - eval_time: 6m
+        alertname: OpsCheckDegraded
+        exp_alerts: []
+      - eval_time: 11m
+        alertname: OpsCheckDegraded
+        exp_alerts:
+          - exp_labels: {severity: warning, instance: "10.77.0.1:9100", host: primary, check: backup, name: Backup}
+            exp_annotations:
+              title: "Backup check failing"
+              summary: "primary: Backup check is failing"

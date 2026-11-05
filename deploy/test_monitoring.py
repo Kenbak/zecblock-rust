@@ -247,10 +247,13 @@ class ConsistencyTests(unittest.TestCase):
     RULES = (ROOT / 'prometheus/rules/fleet.rules.yml').read_text()
     DASHBOARD = json.loads((ROOT / 'grafana/dashboards/zecblock-fleet.json').read_text())
     EXPORTER_SOURCES = ((ROOT / 'exporters/zecblock-host-textfile.py').read_text()
-                        + (ROOT / 'exporters/zecblock-capture-exporter.py').read_text())
+                        + (ROOT / 'exporters/zecblock-capture-exporter.py').read_text()
+                        + (ROOT.parent / 'health-alert-metrics.py').read_text())
+    # Written by the explorer repository's server/deploy/check-ops-health.sh.
+    EXTERNAL_METRICS = {'zecblock_ops_check_ok', 'zecblock_ops_health_last_run_timestamp_seconds'}
 
     def exported(self, name):
-        if name in self.EXPORTER_SOURCES:
+        if name in self.EXTERNAL_METRICS or name in self.EXPORTER_SOURCES:
             return True
         if name.startswith('zecblock_capture_observer_'):
             suffix = name[len('zecblock_capture_observer_'):]

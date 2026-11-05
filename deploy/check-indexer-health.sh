@@ -14,6 +14,10 @@ INDEXER_SERVICE_NAME="${INDEXER_SERVICE_NAME:-cipherscan-rust.service}"
 TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-}"
 TELEGRAM_CHAT_ID="${TELEGRAM_CHAT_ID:-}"
 TELEGRAM_API_BASE="${TELEGRAM_API_BASE:-https://api.telegram.org}"
+# "off" once the fleet monitor (deploy/monitoring) alerts from the metrics below.
+TELEGRAM_ALERTS="${INDEXER_TELEGRAM_ALERTS:-on}"
+# node_exporter textfile collector directory; empty disables metrics.
+METRICS_DIR="${INDEXER_METRICS_DIR-/var/lib/prometheus/node-exporter}"
 HOST_LABEL="$(hostname -f 2>/dev/null || hostname)"
 
 mkdir -p "${STATE_DIR}"
@@ -27,8 +31,12 @@ if [[ -f "${STATE_FILE}" ]]; then
   source "${STATE_FILE}"
 fi
 
-if [[ -z "${TELEGRAM_BOT_TOKEN}" || -z "${TELEGRAM_CHAT_ID}" ]]; then
-  echo "TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID must be set" >&2
+if [[ "${TELEGRAM_ALERTS}" != "on" && "${TELEGRAM_ALERTS}" != "off" ]]; then
+  echo "INDEXER_TELEGRAM_ALERTS must be on or off" >&2
+  exit 2
+fi
+if [[ "${TELEGRAM_ALERTS}" == "on" && ( -z "${TELEGRAM_BOT_TOKEN}" || -z "${TELEGRAM_CHAT_ID}" ) ]]; then
+  echo "TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID must be set (or INDEXER_TELEGRAM_ALERTS=off)" >&2
   exit 2
 fi
 
@@ -39,6 +47,7 @@ fi
 
 send_telegram() {
   local message="$1"
+  [[ "${TELEGRAM_ALERTS}" == "on" ]] || return 0
 
   curl -fsS -X POST \
     "${TELEGRAM_API_BASE}/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
@@ -75,6 +84,18 @@ else
 fi
 
 combined_output="$(printf 'service=%s\nhealth rc=%s\n%s\n' "${service_status}" "${health_rc}" "${health_output}")"
+
+# Metrics for the fleet monitor: health, reason codes (no heights, clocks or
+# hostnames), service state and run time. Written atomically; never fatal.
+write_metrics() {
+  [[ -n "${METRICS_DIR}" && -d "${METRICS_DIR}" ]] || return 0
+  local tmp="${METRICS_DIR}/.zecblock_indexer_health.prom.$$"
+  {
+    printf '%s' "${health_output}" | python3 "${SCRIPT_DIR}/health-alert-metrics.py" \
+      "${service_status}" "${health_rc}" "${now}"
+  } > "${tmp}" 2>/dev/null && mv -f "${tmp}" "${METRICS_DIR}/zecblock_indexer_health.prom" || rm -f "${tmp}"
+}
+write_metrics
 fingerprint="$(printf '%s' "${health_output}" | python3 "${SCRIPT_DIR}/health-alert-fingerprint.py" "${service_status}" "${health_rc}")"
 summary="$(printf '%s' "${combined_output}" | tail -n 40 | cut -c1-3500)"
 

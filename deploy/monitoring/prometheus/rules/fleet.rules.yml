@@ -320,6 +320,49 @@ groups:
         annotations:
           summary: "no census v3 snapshot on {{ $labels.network }} in 7 days"
 
+  - name: zecblock-host-health-checks
+    # Metrics written by the per-host health scripts (check-indexer-health.sh,
+    # check-ops-health.sh) once they stop messaging Telegram directly.
+    # Ops "indexer" and "disk" do not alert: IndexerUnhealthy and DiskSpace*
+    # already cover them, so one problem produces one message.
+    rules:
+      - alert: IndexerUnhealthy
+        expr: zecblock_indexer_healthy == 0
+        for: 5m
+        labels: {severity: critical}
+        annotations:
+          title: "Indexer unhealthy"
+          summary: "{{ $labels.host }} indexer health check failing: {{ $labels.reasons }}"
+      - alert: IndexerHealthCheckStale
+        # The health timer runs every 5 minutes.
+        expr: time() - zecblock_indexer_health_last_run_timestamp_seconds > 1200
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          title: "Indexer health check not running"
+          summary: "{{ $labels.host }} has not run the indexer health check for {{ $value | humanizeDuration }}"
+      - alert: OpsCheckFailing
+        expr: zecblock_ops_check_ok{check=~"node_sync|redis|pg_pool|api_realtime"} == 0
+        for: 5m
+        labels: {severity: critical}
+        annotations:
+          title: "{{ $labels.name }} check failing"
+          summary: "{{ $labels.host }}: {{ $labels.name }} check is failing"
+      - alert: OpsCheckDegraded
+        expr: zecblock_ops_check_ok{check=~"backup|wal|replication|replica"} == 0
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          title: "{{ $labels.name }} check failing"
+          summary: "{{ $labels.host }}: {{ $labels.name }} check is failing"
+      - alert: OpsHealthCheckStale
+        expr: time() - zecblock_ops_health_last_run_timestamp_seconds > 1200
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          title: "Ops health check not running"
+          summary: "{{ $labels.host }} has not run the ops health check for {{ $value | humanizeDuration }}"
+
   - name: zecblock-monitoring
     rules:
       - alert: Watchdog
