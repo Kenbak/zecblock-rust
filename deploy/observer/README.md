@@ -44,8 +44,8 @@ observer (wg 10.77.0.N) ──WireGuard UDP 51820──▶ primary (wg 10.77.0.1
                                                      scram-sha-256, from its /32 only
 ```
 
-Public firewall on observers: 22/tcp key-only behind fail2ban (narrow to an
-admin allowlist after setup), 8233/tcp
+Public firewall on observers: 22/tcp key-only and UFW rate-limited (removed
+from public once WireGuard works), 8233/tcp
 open (Zcash P2P), 51820/udp from the primary only. Everything else denied.
 RPC, gRPC and metrics are never public.
 
@@ -62,6 +62,13 @@ Each step has a check; stop on failure.
 1. **Create the VM** (owner purchase): Ubuntu 24.04, the size above, SSH key
    only, with `cloud-init.yaml` as user data. Record IP, region and order ID in
    the wiki's `server-infrastructure.md` host table.
+   **Security acceptance before anything else is installed:** cloud-init
+   finished and rebooted; `nft list table ip cve_2026_98432` present;
+   `sysctl net.mptcp.enabled` = 0; openssh-server >= 1:9.6p1-3ubuntu13.20 and
+   sudo >= 1.9.15p5-3ubuntu5.24.04.3; `ufw status` shows only 22 (limit), 8233
+   and 51820/udp from the primary; no fail2ban. Record the running kernel: until
+   Ubuntu ships the CVE-2026-98432 fix to -security it is still vulnerable and
+   the nft rule is the only protection.
 2. **Install Zakura**: the same verified release artifact (SHA-256) as the
    primary/standby, to `/usr/local/bin/zakurad`. Write
    `/etc/zakura/zakura.toml` from `zakura-observer.toml`, then **diff it

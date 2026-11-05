@@ -47,6 +47,17 @@ class ObserverKitTest(unittest.TestCase):
         self.assertIn('--observer ${OBSERVER}', unit)
         self.assertIn('Requires=wg-quick@wg0.service', unit)
 
+    def test_cloud_init_security_baseline(self):
+        ci = (HERE / 'cloud-init.yaml').read_text()
+        self.assertTrue(ci.startswith('#cloud-config'))
+        self.assertIn('meta l4proto tcp ip hdrlength != 5 counter drop', ci)
+        self.assertIn('[systemctl, enable, --now, cve-2026-98432-nft.service]', ci)
+        self.assertIn('net.mptcp.enabled = 0', ci)
+        self.assertIn('PasswordAuthentication no', ci)
+        self.assertIn('Automatic-Reboot "true"', ci)
+        self.assertIn('package_reboot_if_required: true', ci)
+        self.assertNotIn('  - fail2ban', ci)
+
 
 if __name__ == '__main__':
     unittest.main()

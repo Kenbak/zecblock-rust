@@ -1,16 +1,26 @@
 #cloud-config
 # Regional block observer base image. Contains no secrets: the WireGuard key is
 # generated on the host, and the DB password arrives later over SSH.
-# Root SSH keys come from the provider's selected account keys. SSH stays open
-# but key-only behind fail2ban; narrow it to an admin allowlist after setup.
-# node_exporter is bound to the WireGuard address in the WireGuard step.
+# Root SSH keys come from the provider's selected account keys.
+#
+# Security baseline (see wiki architecture/cipherscan-security.md, 2026-11-05):
+# - CVE-2026-98432 (IPv4 TCP UAF, remote): Ubuntu's fixed kernel is still in
+#   -proposed. Same stopgap as the other eight hosts: drop IPv4 TCP packets
+#   carrying IP options before the TCP stack, plus MPTCP disabled.
+#   Unattended security upgrades with automatic reboot pick up the fixed
+#   kernel as soon as it reaches -security.
+# - Fail2ban is NOT installed: its stock SSH filter is affected by
+#   CVE-2026-109786. SSH is key-only and rate limited by UFW; public SSH is
+#   removed once WireGuard is up (README step 4).
+# - First boot installs all pending updates (openssh/sudo USN fixes) and reboots.
 package_update: true
 package_upgrade: true
+package_reboot_if_required: true
 packages:
   - chrony
   - wireguard
   - ufw
-  - fail2ban
+  - nftables
   - unattended-upgrades
   - prometheus-node-exporter
   - python3
@@ -25,10 +35,47 @@ write_files:
       PasswordAuthentication no
       KbdInteractiveAuthentication no
       PermitRootLogin prohibit-password
+      MaxAuthTries 3
+      LoginGraceTime 20
   - path: /etc/sysctl.d/99-disable-mptcp.conf
     content: |
       net.mptcp.enabled = 0
+  - path: /etc/nftables.d/cve-2026-98432.nft
+    content: |
+      table ip cve_2026_98432 {
+        chain prerouting {
+          type filter hook prerouting priority raw; policy accept;
+          meta l4proto tcp ip hdrlength != 5 counter drop
+        }
+      }
+  - path: /etc/systemd/system/cve-2026-98432-nft.service
+    content: |
+      [Unit]
+      Description=Drop IPv4 TCP with IP options (CVE-2026-98432 stopgap)
+      DefaultDependencies=no
+      Before=network-pre.target
+      Wants=network-pre.target
+
+      [Service]
+      Type=oneshot
+      RemainAfterExit=yes
+      ExecStart=/usr/sbin/nft -f /etc/nftables.d/cve-2026-98432.nft
+      ExecStop=/usr/sbin/nft delete table ip cve_2026_98432
+
+      [Install]
+      WantedBy=multi-user.target
+  - path: /etc/apt/apt.conf.d/20auto-upgrades
+    content: |
+      APT::Periodic::Update-Package-Lists "1";
+      APT::Periodic::Unattended-Upgrade "1";
+  - path: /etc/apt/apt.conf.d/52observer-upgrades
+    # Single-purpose box: a short collector gap is recorded, an unpatched kernel is not acceptable.
+    content: |
+      Unattended-Upgrade::Automatic-Reboot "true";
+      Unattended-Upgrade::Automatic-Reboot-Time "04:00";
 runcmd:
+  - [systemctl, daemon-reload]
+  - [systemctl, enable, --now, cve-2026-98432-nft.service]
   - [sysctl, --system]
   - [systemctl, disable, --now, prometheus-node-exporter]
   - [systemctl, restart, ssh]
@@ -38,8 +85,7 @@ runcmd:
   - [sh, -c, "umask 077 && wg genkey | tee /etc/wireguard/observer.key | wg pubkey > /etc/wireguard/observer.pub"]
   - [ufw, default, deny, incoming]
   - [ufw, default, allow, outgoing]
-  - [ufw, allow, "22/tcp"]
+  - [ufw, limit, "22/tcp"]
   - [ufw, allow, "8233/tcp"]
   - [ufw, allow, from, 37.27.61.34, to, any, port, "51820", proto, udp]
   - [ufw, --force, enable]
-  - [systemctl, enable, --now, fail2ban]
