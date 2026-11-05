@@ -325,13 +325,16 @@ groups:
           impact: "Very soon new observations will be dropped and lost for good."
           action: "Fix the observer's database connection now (WireGuard or PostgreSQL)."
       - alert: CaptureObserverGaps
-        expr: increase(zecblock_capture_observer_gaps_total[1h]) > 0
+        # Recurring only: interruptions in at least 3 separate 10-minute windows
+        # within an hour. One node restart (a burst of reconnect retries, each
+        # counted as a gap) stays in one window and does not alert.
+        expr: count_over_time((increase(zecblock_capture_observer_gaps_total[10m]) > 0)[1h:10m]) >= 3
         labels: {severity: warning}
         annotations:
-          title: "Observer missed part of the block feed"
-          summary: "This observer had {{ $value | printf \"%.0f\" }} gaps in its block feed in the last hour."
-          impact: "Some blocks may have been missed by this observer. Other observers usually cover it."
-          action: "Nothing urgent. If it repeats, check the node's logs and network on that observer."
+          title: "Observer keeps losing its block feed"
+          summary: "This observer's live block feed was interrupted in {{ $value | printf \"%.0f\" }} separate 10-minute periods in the last hour."
+          impact: "It reconnects by itself each time, but while it keeps dropping it may miss competing blocks. Other observers usually cover them."
+          action: "For a zecminingpool.com node, ask its operator whether the node is restarting or overloaded. For our own observers, check the node and collector logs."
       - alert: CaptureObserverNoRecentReceipts
         # initial: ~16 blocks expected in 20 m.
         expr: zecblock_capture_observer_last_receipt_age_seconds > 1200 and on (network, observer) zecblock_capture_observer_heartbeat_age_seconds < 45

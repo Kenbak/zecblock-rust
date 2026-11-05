@@ -248,3 +248,21 @@ tests:
               impact: "The site still works, but a safety net (backups or replication) is not doing its job."
               summary: "The Backup check on this server is failing."
               title: "Backup check failing"
+
+  - name: observer gaps alert only when recurring, not for one restart burst
+    interval: 1m
+    input_series:
+      - series: 'zecblock_capture_observer_gaps_total{network="mainnet",observer="ext-zcashpools-bhs"}'
+        values: '0x10 17x60'
+      - series: 'zecblock_capture_observer_gaps_total{network="mainnet",observer="do-sgp1"}'
+        values: '0x4 1x19 2x19 3x30'
+    alert_rule_test:
+      - eval_time: 50m
+        alertname: CaptureObserverGaps
+        exp_alerts:
+          - exp_labels: {severity: warning, network: mainnet, observer: do-sgp1}
+            exp_annotations:
+              title: "Observer keeps losing its block feed"
+              summary: "This observer's live block feed was interrupted in 3 separate 10-minute periods in the last hour."
+              impact: "It reconnects by itself each time, but while it keeps dropping it may miss competing blocks. Other observers usually cover them."
+              action: "For a zecminingpool.com node, ask its operator whether the node is restarting or overloaded. For our own observers, check the node and collector logs."
