@@ -6,6 +6,11 @@ on:
   pull_request:
     branches: [main]
 
+# Cancel superseded PR runs only; every main push and scheduled scan finishes.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 permissions:
   contents: read
 
@@ -17,6 +22,7 @@ jobs:
     name: fmt + clippy
     # Match the Ubuntu 24.04 mainnet hosts; newer build images may require newer glibc.
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - name: Install protoc (required to build the gRPC .proto files)
@@ -34,6 +40,7 @@ jobs:
     name: build + test (with Postgres)
     # Match the Ubuntu 24.04 mainnet hosts; newer build images may require newer glibc.
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
     services:
       postgres:
         image: postgres:16
