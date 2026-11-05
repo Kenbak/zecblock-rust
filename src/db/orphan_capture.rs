@@ -18,8 +18,13 @@ use tonic::transport::Endpoint;
 use zakura_chain::block::{Block, MAX_BLOCK_BYTES};
 use zakura_chain::serialization::ZcashDeserialize;
 
-const MAX_JOURNAL_BYTES: u64 = 256 * 1024 * 1024;
+// Pending (undelivered) journal budget. At NU7's 25-second spacing, 1 GiB holds
+// about 3.5 hours of maximum-size 2 MB blocks while PostgreSQL is unavailable.
+const DEFAULT_JOURNAL_BYTES: u64 = 1024 * 1024 * 1024;
+const MIN_JOURNAL_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_JOURNAL_BYTES_LIMIT: u64 = 16 * 1024 * 1024 * 1024;
 const MAX_RECORDS: usize = 4096;
+const MAX_RECENT_GAPS: usize = 32;
 const QUEUE_BLOCKS: usize = 8;
 const MAX_META_BYTES: usize = 4096;
 const MAGIC: &[u8; 8] = b"CSCAP001";
@@ -77,6 +82,26 @@ fn decode(
     })
 }
 
+/// Configured pending-journal budget (`CAPTURE_JOURNAL_MAX_BYTES`), clamped.
+fn journal_max_bytes() -> u64 {
+    parse_journal_max_bytes(std::env::var("CAPTURE_JOURNAL_MAX_BYTES").ok().as_deref())
+}
+
+fn parse_journal_max_bytes(value: Option<&str>) -> u64 {
+    value
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map(|v| v.clamp(MIN_JOURNAL_BYTES, MAX_JOURNAL_BYTES_LIMIT))
+        .unwrap_or(DEFAULT_JOURNAL_BYTES)
+}
+
+/// A closed interval during which this collector was not streaming.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+struct GapInterval {
+    start_ms: u64,
+    end_ms: u64,
+    reason: String,
+}
+
 #[derive(Default, Serialize, Deserialize)]
 struct Health {
     network: String,
@@ -93,6 +118,16 @@ struct Health {
     receipt_session: Option<String>,
     #[serde(default)]
     head_heights: HashMap<String, u32>,
+    // Total closed not-streaming time, and the open interval if any. Replay can
+    // still recover retained blocks, so this bounds unverified time only.
+    #[serde(default)]
+    unobserved_ms: u64,
+    #[serde(default)]
+    outage_since_ms: Option<u64>,
+    #[serde(default)]
+    outage_reason: Option<String>,
+    #[serde(default)]
+    recent_gaps: Vec<GapInterval>,
 }
 
 struct Journal {
@@ -102,6 +137,25 @@ struct Journal {
     records: HashMap<String, Evidence>,
     bytes: u64,
     max_bytes: u64,
+}
+
+/// Parent hash of a block still pending in the journal, from its metadata only.
+/// `hash` must already be validated lowercase hex; anything unreadable is "absent".
+pub(crate) fn read_journal_parent(directory: &Path, hash: &str) -> Option<String> {
+    if hash.len() != 64 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let mut file = std::fs::File::open(directory.join(format!("{hash}.capture"))).ok()?;
+    let mut header = [0; 12];
+    file.read_exact(&mut header).ok()?;
+    let meta_len = u32::from_be_bytes(header[8..].try_into().ok()?) as usize;
+    if &header[..8] != MAGIC || meta_len > MAX_META_BYTES {
+        return None;
+    }
+    let mut meta = vec![0; meta_len];
+    file.read_exact(&mut meta).ok()?;
+    let evidence: Evidence = serde_json::from_slice(&meta).ok()?;
+    (evidence.hash == hash).then_some(evidence.parent)
 }
 
 fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
@@ -172,6 +226,11 @@ impl Journal {
             }
         };
         health.connected = false;
+        if health.outage_since_ms.is_none() && health.updated_at_ms > 0 {
+            // Heartbeats persist every 15s, so this is at most ~15s optimistic.
+            health.outage_since_ms = Some(health.updated_at_ms);
+            health.outage_reason = Some("collector not running".into());
+        }
         let mut records = HashMap::new();
         let mut bytes = 0;
         for entry in std::fs::read_dir(directory).map_err(|e| e.to_string())? {
@@ -277,6 +336,34 @@ impl Journal {
         atomic_write(&self.directory.join("health.json"), &bytes)
     }
 
+    /// Opens a not-streaming interval unless one is already open.
+    fn mark_disconnected(&mut self, reason: &str, at_ms: u64) {
+        if self.health.outage_since_ms.is_none() {
+            self.health.outage_since_ms = Some(at_ms);
+            self.health.outage_reason = Some(reason.chars().take(256).collect());
+        }
+    }
+
+    /// Closes the open not-streaming interval, if any.
+    fn mark_connected(&mut self, at_ms: u64) {
+        if let Some(start_ms) = self.health.outage_since_ms.take() {
+            let end_ms = at_ms.max(start_ms);
+            self.health.unobserved_ms = self.health.unobserved_ms.saturating_add(end_ms - start_ms);
+            self.health.recent_gaps.push(GapInterval {
+                start_ms,
+                end_ms,
+                reason: self.health.outage_reason.take().unwrap_or_default(),
+            });
+            let excess = self
+                .health
+                .recent_gaps
+                .len()
+                .saturating_sub(MAX_RECENT_GAPS);
+            self.health.recent_gaps.drain(..excess);
+        }
+        self.health.outage_reason = None;
+    }
+
     fn gap(&mut self, reason: &str) -> Result<(), String> {
         self.health.gaps += 1;
         self.health.last_gap = Some(reason.chars().take(256).collect());
@@ -343,6 +430,14 @@ impl Journal {
             &self.directory.join(format!("{}.capture", evidence.hash)),
             &bytes,
         )?;
+        let half = self.max_bytes / 2;
+        if self.bytes <= half && self.bytes + size > half {
+            tracing::warn!(
+                pending_bytes = self.bytes + size,
+                max_bytes = self.max_bytes,
+                "capture journal over half full; database delivery is falling behind"
+            );
+        }
         self.bytes += size;
         self.advance_head(&evidence);
         self.records.insert(evidence.hash.clone(), evidence);
@@ -389,7 +484,23 @@ pub async fn run_live_capture(
     observer: &str,
 ) -> Result<Summary, String> {
     let sink = DatabaseSink::new(database_url, observer, network)?;
-    run_capture_inner(url, directory, network, None, None, Some(sink)).await
+    // The coverage audit gets its own connection and task so it can never
+    // delay stream draining or journal delivery.
+    let audit_pool = PgPoolOptions::new()
+        .max_connections(1)
+        .acquire_timeout(Duration::from_secs(3))
+        .connect_lazy(database_url)
+        .map_err(|_| "invalid capture database configuration")?;
+    let audit = tokio::spawn(super::capture_audit::run_audit_loop(
+        ZebraRpc::from_env()?,
+        audit_pool,
+        directory.to_owned(),
+        observer.to_owned(),
+        network.to_owned(),
+    ));
+    let result = run_capture_inner(url, directory, network, None, None, Some(sink)).await;
+    audit.abort();
+    result
 }
 
 async fn run_capture_inner(
@@ -410,7 +521,7 @@ async fn run_capture_inner(
     let journal_directory = directory.to_owned();
     let journal_network = network.to_owned();
     let mut journal = tokio::task::spawn_blocking(move || {
-        Journal::open(&journal_directory, &journal_network, MAX_JOURNAL_BYTES)
+        Journal::open(&journal_directory, &journal_network, journal_max_bytes())
     })
     .await
     .map_err(|_| "capture journal worker failed")??;
@@ -516,6 +627,7 @@ async fn run_capture_inner(
             journal.health.receipt_session = receipt_session.clone();
             journal.health.connections += 1;
             journal.health.connected = true;
+            journal.mark_connected(now_ms());
             tokio::task::block_in_place(|| journal.save_health())?;
             let mut stream = response.into_inner();
             let (sender, mut receiver) = tokio::sync::mpsc::channel(QUEUE_BLOCKS);
@@ -599,6 +711,13 @@ async fn run_capture_inner(
             session.await
         };
         journal.health.connected = false;
+        journal.mark_disconnected(
+            result
+                .as_ref()
+                .err()
+                .map_or("capture stream ended", String::as_str),
+            now_ms(),
+        );
         if let Err(error) = result {
             tokio::task::block_in_place(|| journal.gap(&error))?;
             if error == "capture journal full"
@@ -653,11 +772,17 @@ async fn run_capture_inner(
     })
 }
 
+/// True when migration 042's observer coverage columns exist on the relation the
+/// unqualified name resolves to (search path, so test temp schemas apply too).
+pub(crate) const COVERAGE_COLUMNS_SQL: &str = "SELECT count(*) = 6 FROM pg_attribute WHERE attrelid = to_regclass('block_capture_observers') AND NOT attisdropped AND attname IN ('coverage_since','unobserved_ms','outage_since','recent_gaps','pending_bytes','journal_max_bytes')";
+
 /// One connection, bounded statements and batches keep this separate from canonical ingestion.
 struct DatabaseSink {
     pool: PgPool,
     observer: String,
     network: String,
+    // 0 = not yet checked, 1 = migration 042 present, 2 = absent (pre-042 schema).
+    coverage_schema: std::sync::atomic::AtomicU8,
 }
 
 impl DatabaseSink {
@@ -679,6 +804,7 @@ impl DatabaseSink {
             pool,
             observer: observer.into(),
             network: network.into(),
+            coverage_schema: Default::default(),
         })
     }
 
@@ -698,6 +824,27 @@ impl DatabaseSink {
                 Ok(())
             }
         }
+    }
+
+    /// Migration 042 adds coverage columns; older schemas keep the 035 contract.
+    async fn has_coverage_schema(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    ) -> Result<bool, String> {
+        use std::sync::atomic::Ordering;
+        match self.coverage_schema.load(Ordering::Relaxed) {
+            1 => return Ok(true),
+            2 => return Ok(false),
+            _ => {}
+        }
+        // Check the exact columns the UPDATE writes, on the relation it resolves to.
+        let present: bool = sqlx::query_scalar(COVERAGE_COLUMNS_SQL)
+            .fetch_one(&mut **tx)
+            .await
+            .map_err(|_| "capture database identity")?;
+        self.coverage_schema
+            .store(if present { 1 } else { 2 }, Ordering::Relaxed);
+        Ok(present)
     }
 
     async fn flush(&self, journal: &mut Journal) -> Result<(), String> {
@@ -735,6 +882,18 @@ impl DatabaseSink {
             .bind(journal.health.gaps as i64).bind((journal.records.len()-records.len()) as i32)
             .bind(&journal.health.last_gap).bind(journal.health.last_gap_at_ms.map(|v|v as f64))
             .execute(&mut *tx).await.map_err(|_| "capture database observer")?;
+        if self.has_coverage_schema(&mut tx).await? {
+            let gaps = serde_json::to_string(&journal.health.recent_gaps)
+                .map_err(|_| "capture health encoding")?;
+            sqlx::query("UPDATE block_capture_observers SET coverage_since=COALESCE(coverage_since, now()), unobserved_ms=$2, outage_since=to_timestamp($3::double precision/1000), recent_gaps=$4::jsonb, pending_bytes=$5, journal_max_bytes=$6 WHERE observer=$1")
+                .bind(&self.observer)
+                .bind(i64::try_from(journal.health.unobserved_ms).unwrap_or(i64::MAX))
+                .bind(journal.health.outage_since_ms.map(|v| v as f64))
+                .bind(gaps)
+                .bind(i64::try_from(journal.bytes).unwrap_or(i64::MAX))
+                .bind(i64::try_from(journal.max_bytes).unwrap_or(i64::MAX))
+                .execute(&mut *tx).await.map_err(|_| "capture database observer coverage")?;
+        }
         for evidence in &records {
             let path = journal.directory.join(format!("{}.capture", evidence.hash));
             let bytes = tokio::fs::read(&path)
@@ -837,10 +996,11 @@ mod tests {
             pool,
             observer: "test-observer".into(),
             network: "mainnet".into(),
+            coverage_schema: Default::default(),
         };
         let message = fixture();
         let evidence = decode(&message, 1000, Some("session-one".into())).unwrap();
-        let mut journal = Journal::open(&path, "mainnet", MAX_JOURNAL_BYTES).unwrap();
+        let mut journal = Journal::open(&path, "mainnet", DEFAULT_JOURNAL_BYTES).unwrap();
         journal.store(evidence.clone(), &message.data).unwrap();
         // A failed delivery retains the durable buffer (simulated database write rejection).
         sqlx::query("ALTER TABLE captured_blocks ADD CONSTRAINT simulate_unavailable CHECK (false) NOT VALID")
@@ -850,7 +1010,7 @@ mod tests {
         assert!(sink.flush(&mut journal).await.is_err());
         assert_eq!(journal.records.len(), 1);
         drop(journal);
-        let mut journal = Journal::open(&path, "mainnet", MAX_JOURNAL_BYTES).unwrap();
+        let mut journal = Journal::open(&path, "mainnet", DEFAULT_JOURNAL_BYTES).unwrap();
         sqlx::query("ALTER TABLE captured_blocks DROP CONSTRAINT simulate_unavailable")
             .execute(&sink.pool)
             .await
@@ -929,6 +1089,308 @@ mod tests {
         std::fs::remove_dir_all(path).unwrap();
     }
 
+    #[test]
+    fn journal_budget_is_configurable_and_clamped() {
+        assert_eq!(parse_journal_max_bytes(None), DEFAULT_JOURNAL_BYTES);
+        assert_eq!(parse_journal_max_bytes(Some("junk")), DEFAULT_JOURNAL_BYTES);
+        assert_eq!(parse_journal_max_bytes(Some("1")), MIN_JOURNAL_BYTES);
+        assert_eq!(
+            parse_journal_max_bytes(Some("99999999999999")),
+            MAX_JOURNAL_BYTES_LIMIT
+        );
+        assert_eq!(parse_journal_max_bytes(Some(" 2147483648 ")), 2_147_483_648);
+        // 1 GiB holds at least 500 maximum-size blocks (~3.5 h at 25 s spacing).
+        assert!(DEFAULT_JOURNAL_BYTES / (MAX_BLOCK_BYTES + MAX_META_BYTES as u64 + 12) >= 500);
+    }
+
+    #[test]
+    fn not_streaming_time_is_recorded_as_closed_intervals_across_restarts() {
+        let path = directory();
+        let mut journal = Journal::open(&path, "mainnet", DEFAULT_JOURNAL_BYTES).unwrap();
+        // A brand-new journal has no prior run, so nothing before start is a gap.
+        assert_eq!(journal.health.outage_since_ms, None);
+        journal.mark_connected(1_000);
+        assert!(journal.health.recent_gaps.is_empty());
+        journal.mark_disconnected("capture stream error", 5_000);
+        journal.mark_disconnected("later error does not move the start", 6_000);
+        journal.mark_connected(9_000);
+        assert_eq!(journal.health.unobserved_ms, 4_000);
+        assert_eq!(
+            journal.health.recent_gaps,
+            vec![GapInterval {
+                start_ms: 5_000,
+                end_ms: 9_000,
+                reason: "capture stream error".into()
+            }]
+        );
+        journal.save_health().unwrap();
+        let last_alive = journal.health.updated_at_ms;
+        drop(journal);
+        // Restart: the outage starts at the previous run's last durable heartbeat.
+        let mut journal = Journal::open(&path, "mainnet", DEFAULT_JOURNAL_BYTES).unwrap();
+        assert_eq!(journal.health.outage_since_ms, Some(last_alive));
+        assert_eq!(
+            journal.health.outage_reason.as_deref(),
+            Some("collector not running")
+        );
+        journal.mark_connected(last_alive + 60_000);
+        assert_eq!(journal.health.unobserved_ms, 64_000);
+        assert_eq!(journal.health.recent_gaps.len(), 2);
+        // A crash while disconnected keeps the original open interval start.
+        journal.mark_disconnected("capture gRPC connect failed", last_alive + 70_000);
+        journal.save_health().unwrap();
+        drop(journal);
+        let journal = Journal::open(&path, "mainnet", DEFAULT_JOURNAL_BYTES).unwrap();
+        assert_eq!(journal.health.outage_since_ms, Some(last_alive + 70_000));
+        assert_eq!(
+            journal.health.outage_reason.as_deref(),
+            Some("capture gRPC connect failed")
+        );
+        drop(journal);
+        let mut journal = Journal::open(&path, "mainnet", DEFAULT_JOURNAL_BYTES).unwrap();
+        for i in 0..(MAX_RECENT_GAPS as u64 + 5) {
+            journal.mark_disconnected("flap", 10_000_000 + i * 10);
+            journal.mark_connected(10_000_000 + i * 10 + 5);
+        }
+        assert_eq!(journal.health.recent_gaps.len(), MAX_RECENT_GAPS);
+        assert_eq!(
+            journal.health.recent_gaps.last().unwrap().end_ms,
+            10_000_000 + (MAX_RECENT_GAPS as u64 + 4) * 10 + 5
+        );
+        drop(journal);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn pending_journal_parent_lookup_rejects_bad_names_and_mismatches() {
+        let path = directory();
+        let mut journal = Journal::open(&path, "mainnet", DEFAULT_JOURNAL_BYTES).unwrap();
+        let message = fixture();
+        let evidence = decode(&message, 1000, None).unwrap();
+        journal.store(evidence.clone(), &message.data).unwrap();
+        assert_eq!(
+            read_journal_parent(&path, &evidence.hash),
+            Some(evidence.parent.clone())
+        );
+        assert_eq!(read_journal_parent(&path, "../health"), None);
+        assert_eq!(read_journal_parent(&path, &"00".repeat(32)), None);
+        // A file whose metadata names another hash is not evidence for this one.
+        let other = "11".repeat(32);
+        std::fs::copy(
+            path.join(format!("{}.capture", evidence.hash)),
+            path.join(format!("{other}.capture")),
+        )
+        .unwrap();
+        assert_eq!(read_journal_parent(&path, &other), None);
+        drop(journal);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    const COVERAGE_TABLES: &str = "CREATE TEMP TABLE blocks(height bigint PRIMARY KEY, hash text UNIQUE, timestamp bigint);
+        CREATE TEMP TABLE captured_blocks(hash text PRIMARY KEY,network text,height bigint,previous_block_hash text,timestamp bigint,first_seen_at timestamptz,miner_address text,coinbase_hex text,raw_block bytea,raw_pruned boolean DEFAULT false);
+        CREATE TEMP TABLE block_capture_observers(observer text PRIMARY KEY,network text,collection_started_at timestamptz DEFAULT now(),heartbeat_at timestamptz DEFAULT now(),stream_connected boolean,gaps bigint,pending_records integer,last_gap text,last_gap_at timestamptz,
+            coverage_since timestamptz, unobserved_ms bigint, outage_since timestamptz, recent_gaps jsonb, pending_bytes bigint, journal_max_bytes bigint,
+            audit_checked_at timestamptz, audit_status text, audit_fork_tips integer, audit_fork_blocks integer, audit_canonical_checked integer, audit_canonical_missing integer);
+        CREATE TEMP TABLE block_capture_receipts(observer text, hash text REFERENCES captured_blocks(hash),received_at timestamptz,receipt_session text,receipt_order bigint,PRIMARY KEY(observer,hash));
+        CREATE TEMP TABLE block_capture_audit_misses(observer text NOT NULL, hash text NOT NULL, network text NOT NULL, height bigint NOT NULL, branch_len integer NOT NULL, detected_at timestamptz NOT NULL DEFAULT now(), captured_later_at timestamptz, PRIMARY KEY(observer,hash));
+        INSERT INTO blocks VALUES (0,'00040fe8ec8471911baa1db1266ea15dd06b4a8a5c453883c000b031973dce08',0)";
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn coverage_fields_are_delivered_once_migration_042_exists() {
+        let url = std::env::var("DATABASE_URL").expect("disposable DATABASE_URL required");
+        let path = directory();
+        let pool = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&url)
+            .await
+            .unwrap();
+        sqlx::raw_sql(COVERAGE_TABLES).execute(&pool).await.unwrap();
+        let sink = DatabaseSink {
+            pool,
+            observer: "cov".into(),
+            network: "mainnet".into(),
+            coverage_schema: Default::default(),
+        };
+        let mut journal = Journal::open(&path, "mainnet", 64 * 1024 * 1024).unwrap();
+        journal.mark_disconnected("capture stream error", 10_000);
+        journal.mark_connected(70_000);
+        journal.mark_disconnected("capture gRPC connect failed", 80_000);
+        let message = fixture();
+        journal
+            .store(decode(&message, 1000, None).unwrap(), &message.data)
+            .unwrap();
+        sink.flush(&mut journal).await.unwrap();
+        let (unobserved, outage, gaps, max_bytes): (i64, Option<f64>, String, i64) = sqlx::query_as(
+            "SELECT unobserved_ms, extract(epoch FROM outage_since)::float8 * 1000, recent_gaps::text, journal_max_bytes FROM block_capture_observers WHERE observer='cov'")
+            .fetch_one(&sink.pool).await.unwrap();
+        assert_eq!(unobserved, 60_000);
+        assert_eq!(outage, Some(80_000.0));
+        assert!(
+            gaps.contains("\"start_ms\": 10000") && gaps.contains("capture stream error"),
+            "{gaps}"
+        );
+        assert_eq!(max_bytes, 64 * 1024 * 1024);
+        let since: Option<f64> = sqlx::query_scalar("SELECT extract(epoch FROM coverage_since)::float8 FROM block_capture_observers WHERE observer='cov'")
+            .fetch_one(&sink.pool).await.unwrap();
+        // Set once at the first timed delivery, then preserved.
+        sqlx::query("UPDATE block_capture_observers SET heartbeat_at = now()")
+            .execute(&sink.pool)
+            .await
+            .unwrap();
+        sink.flush(&mut journal).await.unwrap();
+        let again: Option<f64> = sqlx::query_scalar("SELECT extract(epoch FROM coverage_since)::float8 FROM block_capture_observers WHERE observer='cov'")
+            .fetch_one(&sink.pool).await.unwrap();
+        assert!(since.is_some());
+        assert_eq!(since, again);
+        sink.pool.close().await;
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pre_042_schema_keeps_the_original_delivery_contract() {
+        let url = std::env::var("DATABASE_URL").expect("disposable DATABASE_URL required");
+        let path = directory();
+        let pool = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&url)
+            .await
+            .unwrap();
+        sqlx::raw_sql("CREATE TEMP TABLE blocks(height bigint PRIMARY KEY, hash text UNIQUE);
+            CREATE TEMP TABLE captured_blocks(hash text PRIMARY KEY,network text,height bigint,previous_block_hash text,timestamp bigint,first_seen_at timestamptz,miner_address text,coinbase_hex text,raw_block bytea,raw_pruned boolean DEFAULT false);
+            CREATE TEMP TABLE block_capture_observers(observer text PRIMARY KEY,network text,collection_started_at timestamptz DEFAULT now(),heartbeat_at timestamptz DEFAULT now(),stream_connected boolean,gaps bigint,pending_records integer,last_gap text,last_gap_at timestamptz);
+            CREATE TEMP TABLE block_capture_receipts(observer text, hash text REFERENCES captured_blocks(hash),received_at timestamptz,receipt_session text,receipt_order bigint,PRIMARY KEY(observer,hash));
+            INSERT INTO blocks VALUES (0,'00040fe8ec8471911baa1db1266ea15dd06b4a8a5c453883c000b031973dce08')")
+            .execute(&pool).await.unwrap();
+        let sink = DatabaseSink {
+            pool,
+            observer: "old".into(),
+            network: "mainnet".into(),
+            coverage_schema: Default::default(),
+        };
+        let mut journal = Journal::open(&path, "mainnet", DEFAULT_JOURNAL_BYTES).unwrap();
+        let message = fixture();
+        journal
+            .store(decode(&message, 1000, None).unwrap(), &message.data)
+            .unwrap();
+        sink.flush(&mut journal).await.unwrap();
+        assert!(journal.records.is_empty());
+        sink.pool.close().await;
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn audit_walks_fork_branches_through_journal_and_database_and_counts_stream_drops() {
+        use super::super::capture_audit::{
+            confirm, record, uncaptured_fork_blocks, ForkTip, Outcome,
+        };
+        let url = std::env::var("DATABASE_URL").expect("disposable DATABASE_URL required");
+        let path = directory();
+        let pool = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&url)
+            .await
+            .unwrap();
+        sqlx::raw_sql(COVERAGE_TABLES).execute(&pool).await.unwrap();
+        // Branch tip T is still pending in the journal; its parent P was delivered;
+        // P's parent Q was never captured. A second fork F is fully captured.
+        let mut journal = Journal::open(&path, "mainnet", DEFAULT_JOURNAL_BYTES).unwrap();
+        let message = fixture();
+        let tip = decode(&message, 1000, None).unwrap();
+        journal.store(tip.clone(), &message.data).unwrap();
+        let q = "ab".repeat(32);
+        let f = "cd".repeat(32);
+        let f_parent = "ef".repeat(32);
+        sqlx::query("INSERT INTO captured_blocks (hash,network,height,previous_block_hash,timestamp,first_seen_at) VALUES ($1,'mainnet',$2,$3,0,now()),($4,'mainnet',500,$5,0,now())")
+            .bind(&tip.parent).bind(tip.height as i64 - 1).bind(&q).bind(&f).bind(&f_parent)
+            .execute(&pool).await.unwrap();
+        let forks = vec![
+            ForkTip {
+                hash: tip.hash.clone(),
+                height: tip.height as u64,
+                branch_len: 3,
+            },
+            ForkTip {
+                hash: f.clone(),
+                height: 500,
+                branch_len: 1,
+            },
+        ];
+        let (checked, missing) = uncaptured_fork_blocks(&pool, &path, &forks).await.unwrap();
+        assert_eq!(checked, 4);
+        assert_eq!(missing.len(), 1);
+        assert_eq!(missing[0].hash, q);
+        assert_eq!(missing[0].height, tip.height as u64 - 2);
+        // First sighting is only a candidate; the second audit confirms it.
+        let mut candidates = Default::default();
+        assert!(confirm(&mut candidates, missing.clone()).is_empty());
+        let confirmed = confirm(&mut candidates, missing);
+        sqlx::query("INSERT INTO block_capture_observers (observer,network,stream_connected,gaps,pending_records,collection_started_at) VALUES ('aud','mainnet',true,0,0,to_timestamp(100))")
+            .execute(&pool).await.unwrap();
+        record(
+            &pool,
+            "aud",
+            "mainnet",
+            &Ok(Outcome {
+                fork_tips: 2,
+                fork_blocks: 4,
+                confirmed,
+                canonical_checked: 0,
+                canonical_missing: 0,
+            }),
+        )
+        .await
+        .unwrap();
+        record(
+            &pool,
+            "aud",
+            "mainnet",
+            &Ok(Outcome {
+                fork_tips: 2,
+                fork_blocks: 4,
+                confirmed: vec![super::super::capture_audit::Missing {
+                    hash: q.clone(),
+                    height: 1,
+                    branch_len: 3,
+                }],
+                canonical_checked: 0,
+                canonical_missing: 0,
+            }),
+        )
+        .await
+        .unwrap();
+        let (misses, late): (i64, i64) = sqlx::query_as("SELECT count(*), count(captured_later_at) FROM block_capture_audit_misses WHERE observer='aud'").fetch_one(&pool).await.unwrap();
+        assert_eq!((misses, late), (1, 0), "a miss is recorded once");
+        // Late delivery (e.g. retained replay) marks it, never deletes it.
+        sqlx::query("INSERT INTO captured_blocks (hash,network,height,previous_block_hash,timestamp,first_seen_at) VALUES ($1,'mainnet',1,$2,0,now())")
+            .bind(&q).bind("00".repeat(32)).execute(&pool).await.unwrap();
+        record(
+            &pool,
+            "aud",
+            "mainnet",
+            &Err("capture audit timed out".into()),
+        )
+        .await
+        .unwrap();
+        let (misses, late, status, tips): (i64, i64, String, i32) = sqlx::query_as("SELECT (SELECT count(*) FROM block_capture_audit_misses), (SELECT count(captured_later_at) FROM block_capture_audit_misses), audit_status, audit_fork_tips FROM block_capture_observers WHERE observer='aud'").fetch_one(&pool).await.unwrap();
+        assert_eq!((misses, late), (1, 1));
+        assert_eq!(status, "error: capture audit timed out");
+        assert_eq!(tips, 2, "a failed audit keeps the last successful counts");
+        // Canonical stream-drop check: since collection start, outside the settle window.
+        sqlx::query("INSERT INTO blocks (height,hash,timestamp) VALUES (1,$1,50),(2,$2,200),(3,$3,300),(4,$4,400),(5,$5,500),(6,$6,600),(7,$7,700)")
+            .bind("01".repeat(32)).bind(&f).bind("03".repeat(32)).bind(&tip.hash)
+            .bind("05".repeat(32)).bind("06".repeat(32)).bind("07".repeat(32))
+            .execute(&pool).await.unwrap();
+        let (checked, canonical_missing) =
+            super::super::capture_audit::canonical_gaps_for_test(&pool, &path, "aud")
+                .await
+                .unwrap();
+        // Heights 2..=4 are settled and after start; 2 captured, 3 missing, 4 pending in journal.
+        assert_eq!((checked, canonical_missing), (3, 1));
+        drop(journal);
+        pool.close().await;
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
     fn fixture() -> super::super::grpc::proto::BlockAndHash {
         let rows: serde_json::Value =
             serde_json::from_str(include_str!("../../tests/fixtures/parser-blocks.json")).unwrap();
@@ -966,17 +1428,17 @@ mod tests {
         let path = directory();
         let message = fixture();
         let evidence = decode(&message, 123, Some("node-session".into())).unwrap();
-        let mut journal = Journal::open(&path, "mainnet", MAX_JOURNAL_BYTES).unwrap();
-        assert!(Journal::open(&path, "mainnet", MAX_JOURNAL_BYTES).is_err());
+        let mut journal = Journal::open(&path, "mainnet", DEFAULT_JOURNAL_BYTES).unwrap();
+        assert!(Journal::open(&path, "mainnet", DEFAULT_JOURNAL_BYTES).is_err());
         assert!(journal.store(evidence.clone(), &message.data).unwrap());
         assert!(!journal.store(evidence.clone(), &message.data).unwrap());
         assert_eq!(journal.records.len(), 1);
         drop(journal);
-        let resumed = Journal::open(&path, "mainnet", MAX_JOURNAL_BYTES).unwrap();
+        let resumed = Journal::open(&path, "mainnet", DEFAULT_JOURNAL_BYTES).unwrap();
         assert_eq!(resumed.records[&evidence.hash].received_at_ms, 123);
         assert!(resumed.health.heads.contains(&evidence.hash));
         drop(resumed);
-        assert!(Journal::open(&path, "testnet", MAX_JOURNAL_BYTES).is_err());
+        assert!(Journal::open(&path, "testnet", DEFAULT_JOURNAL_BYTES).is_err());
         std::fs::remove_dir_all(path).unwrap();
     }
 
@@ -986,7 +1448,7 @@ mod tests {
         let message = fixture();
         let evidence = decode(&message, 123, None).unwrap();
         let limit = zakura_chain::parameters::MAX_NON_FINALIZED_CHAIN_FORKS;
-        let mut journal = Journal::open(&path, "mainnet", MAX_JOURNAL_BYTES).unwrap();
+        let mut journal = Journal::open(&path, "mainnet", DEFAULT_JOURNAL_BYTES).unwrap();
         journal.health.heads = (0..limit).map(|i| hex::encode([i as u8; 32])).collect();
         let oldest = journal.health.heads[0].clone();
         assert!(journal.store(evidence.clone(), &message.data).unwrap());
@@ -995,7 +1457,7 @@ mod tests {
         assert!(journal.health.heads.contains(&evidence.hash));
         assert_eq!(journal.records.len(), 1);
         drop(journal);
-        let resumed = Journal::open(&path, "mainnet", MAX_JOURNAL_BYTES).unwrap();
+        let resumed = Journal::open(&path, "mainnet", DEFAULT_JOURNAL_BYTES).unwrap();
         assert_eq!(resumed.records[&evidence.hash].received_at_ms, 123);
         assert_eq!(resumed.health.heads.len(), limit);
         drop(resumed);
@@ -1008,12 +1470,12 @@ mod tests {
         let message = fixture();
         let evidence = decode(&message, 123, None).unwrap();
         let limit = zakura_chain::parameters::MAX_NON_FINALIZED_CHAIN_FORKS;
-        let mut journal = Journal::open(&path, "mainnet", MAX_JOURNAL_BYTES).unwrap();
+        let mut journal = Journal::open(&path, "mainnet", DEFAULT_JOURNAL_BYTES).unwrap();
         journal.store(evidence.clone(), &message.data).unwrap();
         journal.health.heads = (0..limit + 1).map(|i| hex::encode([i as u8; 32])).collect();
         journal.save_health().unwrap();
         drop(journal);
-        let resumed = Journal::open(&path, "mainnet", MAX_JOURNAL_BYTES).unwrap();
+        let resumed = Journal::open(&path, "mainnet", DEFAULT_JOURNAL_BYTES).unwrap();
         assert_eq!(resumed.health.heads.len(), limit);
         assert!(resumed.health.heads.contains(&evidence.hash));
         assert_eq!(resumed.records.len(), 1);
@@ -1026,13 +1488,13 @@ mod tests {
     fn oversized_acknowledged_checkpoint_resumes_without_a_fresh_baseline() {
         let path = directory();
         let limit = zakura_chain::parameters::MAX_NON_FINALIZED_CHAIN_FORKS;
-        let mut journal = Journal::open(&path, "mainnet", MAX_JOURNAL_BYTES).unwrap();
+        let mut journal = Journal::open(&path, "mainnet", DEFAULT_JOURNAL_BYTES).unwrap();
         journal.health.heads = (0..limit + 1).map(|i| hex::encode([i as u8; 32])).collect();
         let latest = journal.health.heads.last().unwrap().clone();
         let started = journal.health.started_at_ms;
         journal.save_health().unwrap();
         drop(journal);
-        let resumed = Journal::open(&path, "mainnet", MAX_JOURNAL_BYTES).unwrap();
+        let resumed = Journal::open(&path, "mainnet", DEFAULT_JOURNAL_BYTES).unwrap();
         assert_eq!(resumed.health.heads.len(), limit);
         assert!(resumed.health.heads.contains(&latest));
         assert_eq!(resumed.health.started_at_ms, started);
@@ -1068,7 +1530,7 @@ mod tests {
         let path = directory();
         let mut message = fixture();
         let evidence = decode(&message, 123, None).unwrap();
-        let mut journal = Journal::open(&path, "mainnet", MAX_JOURNAL_BYTES).unwrap();
+        let mut journal = Journal::open(&path, "mainnet", DEFAULT_JOURNAL_BYTES).unwrap();
         journal.store(evidence.clone(), &message.data).unwrap();
         drop(journal);
         message.hash[0] ^= 1;
@@ -1079,7 +1541,7 @@ mod tests {
         message.data.truncate(20);
         assert!(decode(&message, 123, None).is_err());
         std::fs::write(path.join(format!("{}.capture", evidence.hash)), b"corrupt").unwrap();
-        assert!(Journal::open(&path, "mainnet", MAX_JOURNAL_BYTES).is_err());
+        assert!(Journal::open(&path, "mainnet", DEFAULT_JOURNAL_BYTES).is_err());
         std::fs::remove_dir_all(path).unwrap();
     }
 }
