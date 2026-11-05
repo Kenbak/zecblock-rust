@@ -17,14 +17,14 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, Notify};
-use tonic::transport::{Channel, Endpoint};
+use tonic::transport::Channel;
 use tonic::Streaming;
 use zakura_chain::block::Header;
 use zakura_chain::serialization::ZcashDeserialize;
 
 async fn connect_channel(url: &str) -> Result<Channel, String> {
-    Endpoint::from_shared(url.to_string())
-        .map_err(|e| format!("Invalid gRPC URL: {e}"))?
+    super::grpc_tls::GrpcTls::from_env()
+        .endpoint(url)?
         .connect_timeout(Duration::from_secs(10))
         .tcp_keepalive(Some(Duration::from_secs(30)))
         .connect()

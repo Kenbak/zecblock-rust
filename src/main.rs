@@ -387,6 +387,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .zebra_grpc_url
                 .as_deref()
                 .ok_or("ZEBRA_GRPC_URL required")?;
+            db::grpc_tls::GrpcTls::from_env().check(url)?;
             let summary = db::orphan_capture::run_capture(
                 url,
                 &journal,
@@ -409,6 +410,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .zebra_grpc_url
                 .as_deref()
                 .ok_or("ZEBRA_GRPC_URL required")?;
+            db::grpc_tls::GrpcTls::from_env().check(url)?;
             db::orphan_capture::run_live_capture(
                 url,
                 &journal,

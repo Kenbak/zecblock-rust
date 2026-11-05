@@ -2,6 +2,7 @@
 
 pub mod capture_audit;
 pub mod grpc;
+pub mod grpc_tls;
 pub mod observations;
 pub mod orphan_capture;
 pub mod postgres;
