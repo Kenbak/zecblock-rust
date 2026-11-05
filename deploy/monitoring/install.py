@@ -162,6 +162,9 @@ def install_monitor(plan):
     plan.copy(HERE / 'alertmanager/telegram.tmpl', ETC / 'alertmanager/telegram.tmpl')
     plan.copy(HERE / 'alertmanager/render-alertmanager.py', OPT / 'bin/render-alertmanager.py', 0o755)
     plan.copy(HERE / 'exporters/zecblock-host-textfile.py', OPT / 'bin/zecblock-host-textfile.py', 0o755)
+    # Grafana logs errors at every start if these provisioning dirs are missing.
+    for sub in ('plugins', 'alerting'):
+        plan.run('install', '-d', '-m', '0755', str(ETC / 'grafana/provisioning' / sub))
     for p in sorted((HERE / 'grafana/provisioning/datasources').glob('*.yml')):
         plan.copy(p, ETC / 'grafana/provisioning/datasources' / p.name)
     for p in sorted((HERE / 'grafana/provisioning/dashboards').glob('*.yml')):
