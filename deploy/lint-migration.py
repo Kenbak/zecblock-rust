@@ -72,19 +72,39 @@ def statements(sql):
         yield " ".join("".join(out).split())
 
 
+IDENTIFIER = r"[A-Za-z_][A-Za-z0-9_$]*(?:\.[A-Za-z_][A-Za-z0-9_$]*)?"
+CREATE_TABLE = re.compile(
+    rf"^CREATE\s+(?:UNLOGGED\s+)?TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?({IDENTIFIER})\s*\(", re.I)
+INDEX_TARGET = re.compile(rf"\bON\s+(?:ONLY\s+)?({IDENTIFIER})\s*(?:USING\s+\w+\s*)?\(", re.I)
+
+
 def lint(sql):
     errors, warnings = [], []
     transaction = False
+    # Tables created by this file inside the currently open transaction. A
+    # plain CREATE INDEX on such a table locks only a table no other session
+    # can see yet, so it cannot block online traffic. Quoted identifiers are
+    # masked by statements() and therefore never qualify (fail closed).
+    new_tables = set()
     for statement in statements(sql):
         if re.match(r"^(?:BEGIN|START TRANSACTION)\b", statement, re.I):
             transaction = True
+            new_tables = set()
         elif re.match(r"^(?:COMMIT|END|ROLLBACK|ABORT)\b", statement, re.I):
             if not re.match(r"^ROLLBACK(?: WORK| TRANSACTION)? TO\b", statement, re.I):
                 transaction = bool(re.search(r"\bAND CHAIN\b", statement, re.I))
+                new_tables = set()
+        create_table = CREATE_TABLE.match(statement)
+        # statements() masks quoted text as the bare word "quoted"; never trust it.
+        if create_table and transaction and "quoted" not in create_table[1].lower().split("."):
+            new_tables.add(create_table[1].lower())
         create_index = re.match(r"^CREATE\s+(?:UNIQUE\s+)?INDEX\b(.*)", statement, re.I)
         if create_index:
             concurrent = re.match(r"^\s+CONCURRENTLY\b", create_index[1], re.I)
-            if not concurrent:
+            target = INDEX_TARGET.search(create_index[1])
+            if not concurrent and transaction and target and target[1].lower() in new_tables:
+                pass
+            elif not concurrent:
                 errors.append("blocking CREATE INDEX (missing CONCURRENTLY)")
             elif transaction:
                 errors.append("CONCURRENTLY cannot run inside a transaction block")
