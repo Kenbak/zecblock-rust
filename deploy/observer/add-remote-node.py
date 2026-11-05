@@ -12,7 +12,7 @@ https://<node-ip>:8230 with our client certificate (mutual TLS) and to the
 node's JSON-RPC at http://<node-ip>:8232, and writes receipts to the primary
 over WireGuard. Secrets are read from files, never from argv, and never printed.
 """
-import argparse, ipaddress, pathlib, re, shutil, subprocess, sys
+import argparse, ipaddress, os, pathlib, re, shutil, subprocess, sys
 
 NAME = re.compile(r'^[a-z0-9][a-z0-9-]{0,30}$')
 OBSERVER = re.compile(r'^[A-Za-z0-9_-]{1,80}$')
@@ -64,6 +64,20 @@ def build_env(a, db_password, rpc_password=None, server_ca_path=None):
     return ''.join(f'{k}={quote(v)}\n' for k, v in env.items())
 
 
+def write_private(path, content):
+    """Write a root-only (0600) file without a moment where it is readable by others.
+
+    The env file holds the collector's database password; systemd reads it as
+    EnvironmentFile, so it is stored on disk by design, but never world-readable.
+    """
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        os.fchmod(fd, 0o600)  # an existing file keeps its old mode otherwise
+        os.write(fd, content.encode())
+    finally:
+        os.close(fd)
+
+
 def main(argv):
     p = argparse.ArgumentParser()
     for flag in ('--instance', '--observer', '--node-ip', '--server-ca', '--tls-domain', '--db-role', '--db-password-file'):
@@ -82,8 +96,7 @@ def main(argv):
     ca_dest.chmod(0o644)
     REMOTE_DIR.mkdir(mode=0o700, exist_ok=True)
     env_path = REMOTE_DIR / f'{a.instance}.env'
-    env_path.write_text(content)
-    env_path.chmod(0o600)
+    write_private(env_path, content)
     unit = f'cipherscan-remote-collector@{a.instance}'
     subprocess.run(['systemctl', 'daemon-reload'], check=True)
     subprocess.run(['systemctl', 'enable', '--now', unit], check=True)

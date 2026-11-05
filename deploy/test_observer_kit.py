@@ -91,6 +91,17 @@ class ObserverKitTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             remote.build_env(self.remote_args(rpc_user='zec'), PW)
 
+    def test_remote_env_file_is_never_readable_by_others(self):
+        import os, stat, tempfile
+        with tempfile.TemporaryDirectory() as d:
+            path = pathlib.Path(d) / 'op1.env'
+            remote.write_private(path, 'PGPASSWORD=x\n')
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+            path.chmod(0o644)  # a pre-existing, too-open file is tightened on rewrite
+            remote.write_private(path, 'PGPASSWORD=y\n')
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+            self.assertEqual(path.read_text(), 'PGPASSWORD=y\n')
+
     def test_remote_unit_is_a_template_with_its_own_journal(self):
         unit = (HERE / 'cipherscan-remote-collector@.service').read_text()
         self.assertIn('EnvironmentFile=/etc/cipherscan/remote/%i.env', unit)
