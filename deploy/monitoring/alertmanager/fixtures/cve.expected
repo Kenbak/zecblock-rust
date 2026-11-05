@@ -1,3 +1,8 @@
-🔴 <b>CVE-2026-98432 stopgap missing</b> · do-nyc3
-• do-nyc3 has no CVE-2026-98432 nft drop table
-since 21:02 UTC
+🔴 <b>Security protection missing</b>
+📍 New York observer
+
+<b>What's happening:</b> The firewall rule that protects this server from the CVE-2026-98432 Linux kernel bug is not in place.
+<b>Why it matters:</b> Until it is back, a specially crafted network packet could crash or take over this server.
+<b>What to do:</b> Re-apply the protection now: run the observer/host hardening script again, then check with: nft list table ip cve_2026_98432.
+
+<i>Urgent, look now · started 21:02 UTC</i>

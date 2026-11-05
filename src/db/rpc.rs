@@ -82,9 +82,28 @@ impl ZebraRpc {
             _ => None,
         };
 
-        let client = Client::builder()
+        let mut builder = Client::builder()
             .timeout(Duration::from_secs(30))
-            .connect_timeout(Duration::from_secs(10))
+            .connect_timeout(Duration::from_secs(10));
+        // Remote operators may front JSON-RPC with TLS signed by their own CA.
+        // When set, trust only that CA (no system roots), mirroring gRPC mTLS.
+        if let Some(ca_path) = std::env::var("ZEBRA_RPC_TLS_CA_FILE")
+            .ok()
+            .map(|v| v.trim().to_owned())
+            .filter(|v| !v.is_empty())
+        {
+            if !url.starts_with("https://") {
+                return Err("ZEBRA_RPC_TLS_CA_FILE requires an https:// ZEBRA_RPC_URL".into());
+            }
+            let pem = std::fs::read(&ca_path)
+                .map_err(|e| format!("cannot read RPC TLS CA {}: {}", ca_path, e.kind()))?;
+            let ca = reqwest::Certificate::from_pem(&pem)
+                .map_err(|_| format!("RPC TLS CA {} is not a PEM certificate", ca_path))?;
+            builder = builder
+                .tls_built_in_root_certs(false)
+                .add_root_certificate(ca);
+        }
+        let client = builder
             .build()
             .map_err(|e| format!("Failed to build HTTP client: {}", e))?;
 

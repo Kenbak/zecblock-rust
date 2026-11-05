@@ -102,14 +102,9 @@ summary="$(printf '%s' "${combined_output}" | tail -n 40 | cut -c1-3500)"
 if [[ "${health_rc}" -eq 0 ]]; then
   if [[ "${previous_status}" == "unhealthy" ]]; then
     send_telegram "$(cat <<EOF
-🟢 <b>CipherScan Indexer Recovered</b>
-
-<b>Host:</b> ${HOST_LABEL}
-<b>Time:</b> ${timestamp}
-
-✅ Service active
-✅ Lag ≤ ${MAX_LAG} blocks
-✅ Tip polling and pending-work progress within ${MAX_HEARTBEAT_AGE_SECONDS}s
+✅ <b>Fixed: Indexer having problems</b>
+📍 ${HOST_LABEL}
+The indexer is running and keeping up with the chain again (${timestamp}). Nothing to do.
 EOF
 )"
   fi
@@ -128,16 +123,25 @@ elif (( now - previous_alert_at >= ALERT_COOLDOWN_SECONDS )); then
 fi
 
 if (( should_alert == 1 )); then
+  if [[ "${service_status}" != "active" ]]; then
+    happening="The indexer is not running (service state: ${service_status})."
+    todo="Start it: <code>systemctl restart ${INDEXER_SERVICE_NAME}</code>, then check it stays up with <code>journalctl -u ${INDEXER_SERVICE_NAME} -n 100</code>."
+  else
+    happening="The indexer is running but failing its health check: it is more than ${MAX_LAG} blocks behind, has failed ${MAX_CONSECUTIVE_FAILURES}+ times in a row, or has not made progress for ${MAX_HEARTBEAT_AGE_SECONDS}s."
+    todo="Look at its logs: <code>journalctl -u ${INDEXER_SERVICE_NAME} -n 100</code>. If the Zcash node is fine, a restart (<code>systemctl restart ${INDEXER_SERVICE_NAME}</code>) often fixes it."
+  fi
+  details="$(printf '%s' "${summary}" | tail -n 15 | cut -c1-1500 | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g')"
   send_telegram "$(cat <<EOF
-🔴 <b>CipherScan Indexer Alert</b>
+🔴 <b>Indexer having problems</b>
+📍 ${HOST_LABEL}
 
-<b>Host:</b> ${HOST_LABEL}
-<b>Time:</b> ${timestamp}
+<b>What’s happening:</b> ${happening}
+<b>Why it matters:</b> The indexer copies new blocks into our database, so new blocks and transactions may not appear on the website.
+<b>What to do:</b> ${todo}
 
-❌ Service: ${service_status}
-<b>Thresholds:</b> lag ≤ ${MAX_LAG}, failures ≤ ${MAX_CONSECUTIVE_FAILURES}, tip polling/pending progress ≤ ${MAX_HEARTBEAT_AGE_SECONDS}s
-
-<pre>${summary}</pre>
+Technical details:
+<pre>${details}</pre>
+<i>Urgent, look now · ${timestamp} · repeats while it lasts</i>
 EOF
 )"
   persist_state "unhealthy" "${fingerprint}" "${now}"
