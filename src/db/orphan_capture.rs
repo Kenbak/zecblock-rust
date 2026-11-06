@@ -783,6 +783,72 @@ struct DatabaseSink {
     network: String,
     // 0 = not yet checked, 1 = migration 042 present, 2 = absent (pre-042 schema).
     coverage_schema: std::sync::atomic::AtomicU8,
+    flush_control: FlushControl,
+}
+
+/// Largest number of journal records delivered in one transaction.
+const MAX_FLUSH_BATCH: usize = 32;
+const DEFAULT_FLUSH_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Bounds one delivery transaction. Each record costs two round trips on top of
+/// about eight fixed ones, so on a distant observer (300+ ms to the primary) a
+/// full 32-record batch cannot finish inside the timeout. A fixed batch then
+/// never drains a backlog: every attempt times out and rolls back. The batch
+/// therefore halves after each timeout (down to one record) and doubles again
+/// after each successful full batch.
+struct FlushControl {
+    batch: std::sync::atomic::AtomicUsize,
+    timeout: Duration,
+}
+
+impl Default for FlushControl {
+    fn default() -> Self {
+        Self {
+            batch: std::sync::atomic::AtomicUsize::new(MAX_FLUSH_BATCH),
+            timeout: DEFAULT_FLUSH_TIMEOUT,
+        }
+    }
+}
+
+impl FlushControl {
+    fn from_env() -> Self {
+        Self {
+            timeout: flush_timeout_from(
+                std::env::var("CAPTURE_FLUSH_TIMEOUT_SECONDS")
+                    .ok()
+                    .as_deref(),
+            ),
+            ..Self::default()
+        }
+    }
+}
+
+/// `CAPTURE_FLUSH_TIMEOUT_SECONDS`, clamped to 1..=60; invalid values use the default.
+fn flush_timeout_from(value: Option<&str>) -> Duration {
+    value
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|secs| *secs > 0)
+        .map(|secs| Duration::from_secs(secs.min(60)))
+        .unwrap_or(DEFAULT_FLUSH_TIMEOUT)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FlushOutcome {
+    /// Committed `delivered` records out of an allowed batch.
+    Delivered(usize),
+    TimedOut,
+    /// Any other database failure: not evidence that the batch is too large.
+    Failed,
+}
+
+fn next_flush_batch(current: usize, outcome: FlushOutcome) -> usize {
+    let current = current.clamp(1, MAX_FLUSH_BATCH);
+    match outcome {
+        FlushOutcome::TimedOut => (current / 2).max(1),
+        // Only a full batch shows the limit was the constraint; a partial one is the whole backlog.
+        FlushOutcome::Delivered(n) if n >= current => (current * 2).min(MAX_FLUSH_BATCH),
+        FlushOutcome::Delivered(_) | FlushOutcome::Failed => current,
+    }
 }
 
 impl DatabaseSink {
@@ -805,25 +871,52 @@ impl DatabaseSink {
             observer: observer.into(),
             network: network.into(),
             coverage_schema: Default::default(),
+            flush_control: FlushControl::from_env(),
         })
     }
 
     async fn try_flush(&self, journal: &mut Journal) -> Result<(), String> {
-        match tokio::time::timeout(Duration::from_secs(5), self.flush(journal)).await {
-            Ok(Ok(())) => Ok(()),
+        use std::sync::atomic::Ordering;
+        let batch = self
+            .flush_control
+            .batch
+            .load(Ordering::Relaxed)
+            .clamp(1, MAX_FLUSH_BATCH);
+        let (result, outcome) = match tokio::time::timeout(
+            self.flush_control.timeout,
+            self.flush(journal, batch),
+        )
+        .await
+        {
+            Ok(Ok(delivered)) => (Ok(()), FlushOutcome::Delivered(delivered)),
             Ok(Err(error))
                 if error.starts_with("capture file")
                     || error.starts_with("capture health")
                     || error == "capture database network mismatch" =>
             {
-                Err(error)
+                (Err(error), FlushOutcome::Failed)
             }
-            _ => {
+            Ok(Err(_)) => {
                 // Keep every unacknowledged file. Do not expose connection strings in logs.
                 tracing::warn!("capture database unavailable; retained blocks will be retried");
-                Ok(())
+                (Ok(()), FlushOutcome::Failed)
             }
+            Err(_) => (Ok(()), FlushOutcome::TimedOut),
+        };
+        let next = next_flush_batch(batch, outcome);
+        if next != batch {
+            self.flush_control.batch.store(next, Ordering::Relaxed);
         }
+        if outcome == FlushOutcome::TimedOut {
+            tracing::warn!(
+                batch,
+                next_batch = next,
+                timeout_ms = self.flush_control.timeout.as_millis() as u64,
+                pending = journal.records.len(),
+                "capture delivery timed out; retained blocks will be retried in a smaller batch"
+            );
+        }
+        result
     }
 
     /// Migration 042 adds coverage columns; older schemas keep the 035 contract.
@@ -847,8 +940,10 @@ impl DatabaseSink {
         Ok(present)
     }
 
-    async fn flush(&self, journal: &mut Journal) -> Result<(), String> {
-        let records: Vec<_> = journal.records.values().take(32).cloned().collect();
+    /// Delivers at most `batch` records in one transaction; returns how many.
+    async fn flush(&self, journal: &mut Journal, batch: usize) -> Result<usize, String> {
+        let records: Vec<_> = journal.records.values().take(batch).cloned().collect();
+        let delivered = records.len();
         let mut tx = self
             .pool
             .begin()
@@ -969,13 +1064,53 @@ impl DatabaseSink {
         std::fs::File::open(&journal.directory)
             .and_then(|d| d.sync_all())
             .map_err(|_| "capture file directory sync failed")?;
-        Ok(())
+        Ok(delivered)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn flush_batch_halves_on_timeout_and_recovers_on_full_batches() {
+        use FlushOutcome::*;
+        // A 32-record backlog at ~0.3 s per round trip times out; shrink to one record.
+        let mut batch = MAX_FLUSH_BATCH;
+        let mut seen = vec![batch];
+        while batch > 1 {
+            batch = next_flush_batch(batch, TimedOut);
+            seen.push(batch);
+        }
+        assert_eq!(seen, vec![32, 16, 8, 4, 2, 1]);
+        assert_eq!(next_flush_batch(1, TimedOut), 1);
+        // Other failures (connection refused, role limit) do not change the size.
+        assert_eq!(next_flush_batch(4, Failed), 4);
+        // A partial batch delivered the whole backlog: no evidence to grow.
+        assert_eq!(next_flush_batch(4, Delivered(1)), 4);
+        // Full batches double back to the cap.
+        assert_eq!(next_flush_batch(1, Delivered(1)), 2);
+        assert_eq!(next_flush_batch(16, Delivered(16)), 32);
+        assert_eq!(next_flush_batch(32, Delivered(32)), 32);
+        // Out-of-range state is clamped.
+        assert_eq!(next_flush_batch(0, Failed), 1);
+        assert_eq!(next_flush_batch(500, Failed), MAX_FLUSH_BATCH);
+    }
+
+    #[test]
+    fn flush_timeout_env_is_bounded() {
+        assert_eq!(flush_timeout_from(None), DEFAULT_FLUSH_TIMEOUT);
+        assert_eq!(flush_timeout_from(Some("12")), Duration::from_secs(12));
+        assert_eq!(flush_timeout_from(Some(" 7 ")), Duration::from_secs(7));
+        assert_eq!(flush_timeout_from(Some("600")), Duration::from_secs(60));
+        for bad in ["0", "-3", "abc", ""] {
+            assert_eq!(
+                flush_timeout_from(Some(bad)),
+                DEFAULT_FLUSH_TIMEOUT,
+                "{bad}"
+            );
+        }
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn database_delivery_recovers_deduplicates_and_reclaims_only_acknowledged_files() {
@@ -997,6 +1132,7 @@ mod tests {
             observer: "test-observer".into(),
             network: "mainnet".into(),
             coverage_schema: Default::default(),
+            flush_control: Default::default(),
         };
         let message = fixture();
         let evidence = decode(&message, 1000, Some("session-one".into())).unwrap();
@@ -1007,7 +1143,7 @@ mod tests {
             .execute(&sink.pool)
             .await
             .unwrap();
-        assert!(sink.flush(&mut journal).await.is_err());
+        assert!(sink.flush(&mut journal, MAX_FLUSH_BATCH).await.is_err());
         assert_eq!(journal.records.len(), 1);
         drop(journal);
         let mut journal = Journal::open(&path, "mainnet", DEFAULT_JOURNAL_BYTES).unwrap();
@@ -1015,7 +1151,7 @@ mod tests {
             .execute(&sink.pool)
             .await
             .unwrap();
-        sink.flush(&mut journal).await.unwrap();
+        sink.flush(&mut journal, MAX_FLUSH_BATCH).await.unwrap();
         assert!(journal.records.is_empty());
         assert_eq!(journal.bytes, 0);
         // Replay after acknowledgement/receipt-session change does not duplicate or overwrite first receipt.
@@ -1023,7 +1159,7 @@ mod tests {
         replay.received_at_ms = 9000;
         replay.receipt_session = Some("session-two".into());
         journal.store(replay, &message.data).unwrap();
-        sink.flush(&mut journal).await.unwrap();
+        sink.flush(&mut journal, MAX_FLUSH_BATCH).await.unwrap();
         let count: i64 = sqlx::query_scalar("SELECT count(*) FROM captured_blocks")
             .fetch_one(&sink.pool)
             .await
@@ -1048,7 +1184,7 @@ mod tests {
         journal
             .store(competing_evidence.clone(), &competing.data)
             .unwrap();
-        sink.flush(&mut journal).await.unwrap();
+        sink.flush(&mut journal, MAX_FLUSH_BATCH).await.unwrap();
         // Losing blocks keep bodies; only an old canonical match can release its redundant body.
         sqlx::query("INSERT INTO blocks VALUES ($1,$2),($3,'later-tip')")
             .bind(evidence.height as i64)
@@ -1057,7 +1193,7 @@ mod tests {
             .execute(&sink.pool)
             .await
             .unwrap();
-        sink.flush(&mut journal).await.unwrap();
+        sink.flush(&mut journal, MAX_FLUSH_BATCH).await.unwrap();
         let pruned: bool = sqlx::query_scalar(
             "SELECT raw_pruned AND raw_block IS NULL FROM captured_blocks WHERE hash=$1",
         )
@@ -1210,6 +1346,7 @@ mod tests {
             observer: "cov".into(),
             network: "mainnet".into(),
             coverage_schema: Default::default(),
+            flush_control: Default::default(),
         };
         let mut journal = Journal::open(&path, "mainnet", 64 * 1024 * 1024).unwrap();
         journal.mark_disconnected("capture stream error", 10_000);
@@ -1219,7 +1356,7 @@ mod tests {
         journal
             .store(decode(&message, 1000, None).unwrap(), &message.data)
             .unwrap();
-        sink.flush(&mut journal).await.unwrap();
+        sink.flush(&mut journal, MAX_FLUSH_BATCH).await.unwrap();
         let (unobserved, outage, gaps, max_bytes): (i64, Option<f64>, String, i64) = sqlx::query_as(
             "SELECT unobserved_ms, extract(epoch FROM outage_since)::float8 * 1000, recent_gaps::text, journal_max_bytes FROM block_capture_observers WHERE observer='cov'")
             .fetch_one(&sink.pool).await.unwrap();
@@ -1237,7 +1374,7 @@ mod tests {
             .execute(&sink.pool)
             .await
             .unwrap();
-        sink.flush(&mut journal).await.unwrap();
+        sink.flush(&mut journal, MAX_FLUSH_BATCH).await.unwrap();
         let again: Option<f64> = sqlx::query_scalar("SELECT extract(epoch FROM coverage_since)::float8 FROM block_capture_observers WHERE observer='cov'")
             .fetch_one(&sink.pool).await.unwrap();
         assert!(since.is_some());
@@ -1266,13 +1403,14 @@ mod tests {
             observer: "old".into(),
             network: "mainnet".into(),
             coverage_schema: Default::default(),
+            flush_control: Default::default(),
         };
         let mut journal = Journal::open(&path, "mainnet", DEFAULT_JOURNAL_BYTES).unwrap();
         let message = fixture();
         journal
             .store(decode(&message, 1000, None).unwrap(), &message.data)
             .unwrap();
-        sink.flush(&mut journal).await.unwrap();
+        sink.flush(&mut journal, MAX_FLUSH_BATCH).await.unwrap();
         assert!(journal.records.is_empty());
         sink.pool.close().await;
         std::fs::remove_dir_all(path).unwrap();

@@ -28,7 +28,7 @@ def role_sql(role, db, password):
     # role/db come only from validate(); the password is hex.
     assert re.fullmatch(r'[a-z0-9_]{1,63}', role) and re.fullmatch(r'[0-9a-f]{64}', password)
     return f"""DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='{role}') THEN CREATE ROLE {role} LOGIN; END IF; END $$;
-ALTER ROLE {role} WITH PASSWORD '{password}' NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION CONNECTION LIMIT 2;
+ALTER ROLE {role} WITH PASSWORD '{password}' NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION CONNECTION LIMIT 4;
 GRANT CONNECT ON DATABASE {db} TO {role};
 GRANT USAGE ON SCHEMA public TO {role};
 GRANT SELECT ON blocks, block_subsidy_allocations TO {role};

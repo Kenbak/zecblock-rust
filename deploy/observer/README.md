@@ -93,6 +93,17 @@ Each step has a check; stop on failure.
    `block_capture_receipts` rows. `chronyc tracking` offset must stay below
    10 ms. Canonical writer health and standby passivity must be unchanged.
 
+**Distant observers.** One delivery transaction costs about 8 fixed round
+trips plus 2 per journal record. The collector halves its batch after each
+timed-out delivery (down to one record) and doubles it after full batches, so
+a backlog drains even at 300+ ms to the primary. Where one record still needs
+more than the default 5 s (`SYD1` measured 322 ms RTT, about 3.2 s per
+record), set `CAPTURE_FLUSH_TIMEOUT_SECONDS=10` (1–60) in the collector env
+file. Roles get `CONNECTION LIMIT 4`: the sink and the coverage audit hold one
+connection each, and a timed-out transaction's server session can outlive the
+client for a moment while the pool reconnects. Existing roles created with
+limit 2 need `ALTER ROLE ... CONNECTION LIMIT 4` (owner-approved, no restart).
+
 Rollback: stop the collector, revoke and drop the role's login, remove the
 pg_hba line and WireGuard peer. Captured rows and receipts are evidence and
 remain.
