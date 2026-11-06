@@ -25,6 +25,11 @@ const MAX_JOURNAL_BYTES_LIMIT: u64 = 16 * 1024 * 1024 * 1024;
 const MAX_RECORDS: usize = 4096;
 const MAX_RECENT_GAPS: usize = 32;
 const QUEUE_BLOCKS: usize = 8;
+/// Database delivery waits until the block stream has been quiet this long, so a
+/// burst (subscription replay, competing branch) is journaled at fsync speed
+/// before a delivery that can take seconds on a distant observer. Receipt times
+/// are taken when a block arrives, so deferring delivery does not move them.
+const FLUSH_SETTLE: Duration = Duration::from_secs(1);
 const MAX_META_BYTES: usize = 4096;
 const MAGIC: &[u8; 8] = b"CSCAP001";
 
@@ -664,19 +669,38 @@ async fn run_capture_inner(
             enum CaptureEvent {
                 Block(super::grpc::proto::BlockAndHash, u64),
                 Heartbeat,
+                Settled,
                 Closed,
             }
+            // Deliver once the stream is quiet, never between blocks of a burst:
+            // a slow delivery there fills the reader queue and drops the stream.
+            let mut flush_due: Option<tokio::time::Instant> = None;
             loop {
+                let settle = async move {
+                    match flush_due {
+                        Some(at) => tokio::time::sleep_until(at).await,
+                        None => std::future::pending::<()>().await,
+                    }
+                };
                 let event = tokio::select! {
+                    biased;
                     message = receiver.recv() => message
                         .map(|(message, received)| CaptureEvent::Block(message, received))
                         .unwrap_or(CaptureEvent::Closed),
+                    _ = settle => CaptureEvent::Settled,
                     _ = heartbeat.tick() => CaptureEvent::Heartbeat,
                 };
                 let (message, received) = match event {
                     CaptureEvent::Block(message, received) => (message, received),
-                    CaptureEvent::Heartbeat => {
-                        tokio::task::block_in_place(|| journal.save_health())?;
+                    tick @ (CaptureEvent::Heartbeat | CaptureEvent::Settled) => {
+                        if matches!(tick, CaptureEvent::Heartbeat) {
+                            tokio::task::block_in_place(|| journal.save_health())?;
+                        }
+                        // Blocks are waiting: let the reader drain them first.
+                        if !receiver.is_empty() {
+                            continue;
+                        }
+                        flush_due = None;
                         if let Some(sink) = &sink {
                             sink.try_flush(&mut journal).await?;
                         }
@@ -689,9 +713,7 @@ async fn run_capture_inner(
                 if tokio::task::block_in_place(|| journal.store(evidence, &message.data))? {
                     new_blocks += 1;
                 }
-                if let Some(sink) = &sink {
-                    sink.try_flush(&mut journal).await?;
-                }
+                flush_due = Some(tokio::time::Instant::now() + FLUSH_SETTLE);
                 persist_max_ms = persist_max_ms.max(write_started.elapsed().as_secs_f64() * 1000.0);
                 if !forced_reconnect && reconnect_after.is_some_and(|n| new_blocks >= n) {
                     forced_reconnect = true;
