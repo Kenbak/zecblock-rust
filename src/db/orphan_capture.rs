@@ -684,7 +684,8 @@ async fn run_capture_inner(
             // Keep even old resume hints: unrecognized hashes cause retained
             // history to replay. Clearing them and taking a fresh baseline here
             // would instead skip blocks the node can still recover after an outage.
-            if journal.health.heads.is_empty() {
+            let baselined = journal.health.heads.is_empty();
+            if baselined {
                 // Explicit initial baseline, not an assertion of past capture.
                 let mut tips = rpc.get_fork_tip_hashes().await?;
                 let mut stream = client
@@ -716,16 +717,27 @@ async fn run_capture_inner(
             // such forks fill its 200-block subscriber queue, which drops us at
             // once and repeats on every reconnect. Fall back to our heads if the
             // node cannot be asked.
-            let hints = match rpc.get_chain_tips().await {
-                Ok(tips) => {
-                    resume_hints(
-                        &tips,
-                        |hash| journal.has_captured(hash),
-                        |height| rpc.get_block_hash(height),
-                    )
-                    .await
+            // A fresh baseline is already exactly the node's tips: resume hints would
+            // instead replay retained history that this observer never received.
+            let hints = if baselined {
+                Vec::new()
+            } else {
+                match rpc.get_chain_tips().await {
+                    Ok(tips) => {
+                        resume_hints(
+                            &tips,
+                            // Our own heads count as known: they are the tips we
+                            // last stored (or baselined), so a walk may stop there.
+                            |hash| {
+                                journal.has_captured(hash)
+                                    || journal.health.heads.iter().any(|h| h == hash)
+                            },
+                            |height| rpc.get_block_hash(height),
+                        )
+                        .await
+                    }
+                    Err(_) => Vec::new(),
                 }
-                Err(_) => Vec::new(),
             };
             let hint_list = if hints.is_empty() {
                 journal.health.heads.clone()
