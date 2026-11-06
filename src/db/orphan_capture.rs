@@ -476,12 +476,19 @@ fn remember_recent(recent: &mut Vec<String>, hash: &str) {
     }
 }
 
-/// Picks at most one resume hint per node chain: the chain tip if we captured
-/// it, else the newest captured main-chain block at or below the chain's fork
-/// point (forks report `height` and `branchlen`; the block at
-/// `height - branchlen` is on the main chain). A chain with no captured block
-/// in the window gets no hint, so the node resends it (a genuine catch-up).
-/// Lookup failures stop the search for that chain only.
+/// Picks at most one resume hint per node chain so the node resends only
+/// blocks we are missing:
+/// - a chain whose tip we captured: the tip (nothing resent);
+/// - a fork whose tip we lack: the main-chain block at its fork point
+///   (`height - branchlen`), captured or not. The node then resends only the
+///   fork's own blocks; main-chain blocks we lack are resent by the active
+///   chain's walk, which covers every main-chain block;
+/// - the active chain: the newest captured main-chain block within
+///   `RESUME_HINT_WINDOW`, else no hint (the node resends that one chain,
+///   under 100 blocks, which fits its 200-block subscriber queue).
+///
+/// Zakura cannot look up fork blocks by hash over RPC, so only main-chain
+/// heights are queried. A failed lookup only costs that chain's hint.
 async fn resume_hints<F, Fut>(
     tips: &[super::rpc::ChainTip],
     captured: impl Fn(&str) -> bool,
@@ -505,19 +512,14 @@ where
     for tip in tips {
         let hint = if captured(&tip.hash) {
             Some(tip.hash.clone())
+        } else if tip.status != "active" {
+            let fork_point = tip.height.saturating_sub(tip.branchlen);
+            cached_main_hash(&mut cache, &mut main_hash_at, fork_point).await
         } else {
             let mut found = None;
-            let mut height = tip.height.saturating_sub(tip.branchlen);
+            let mut height = tip.height;
             while height >= floor {
-                let hash = match cache.get(&height) {
-                    Some(hash) => hash.clone(),
-                    None => {
-                        let hash = main_hash_at(height).await.ok();
-                        cache.insert(height, hash.clone());
-                        hash
-                    }
-                };
-                match hash {
+                match cached_main_hash(&mut cache, &mut main_hash_at, height).await {
                     Some(hash) if captured(&hash) => {
                         found = Some(hash);
                         break;
@@ -536,6 +538,23 @@ where
     }
     hints.truncate(zakura_chain::parameters::MAX_NON_FINALIZED_CHAIN_FORKS);
     hints
+}
+
+async fn cached_main_hash<F, Fut>(
+    cache: &mut HashMap<u64, Option<String>>,
+    main_hash_at: &mut F,
+    height: u64,
+) -> Option<String>
+where
+    F: FnMut(u64) -> Fut,
+    Fut: std::future::Future<Output = Result<String, String>>,
+{
+    if let Some(hash) = cache.get(&height) {
+        return hash.clone();
+    }
+    let hash = main_hash_at(height).await.ok();
+    cache.insert(height, hash.clone());
+    hash
 }
 
 #[derive(Serialize)]
@@ -1285,17 +1304,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resume_hints_omit_chains_with_nothing_captured_and_survive_lookup_errors() {
+    async fn resume_hints_name_fork_points_even_when_nothing_was_captured() {
+        // Fresh journal or long outage: nothing captured. Forks still get their
+        // fork point, so the node resends only their own blocks plus (with no
+        // active hint) the active chain once: under its 200-block queue.
         let tips = vec![tip("t", "active", 1_000, 0), tip("f", "valid-fork", 990, 2)];
-        // Nothing captured in the window: no hints, so the caller falls back.
-        let none = resume_hints(
+        let hints = resume_hints(
             &tips,
             |_| false,
             |h| std::future::ready(Ok(format!("m{h}"))),
         )
         .await;
-        assert!(none.is_empty());
-        // RPC failing below 995: the active chain still finds 995, the fork gets none.
+        assert_eq!(hints, vec!["m988".to_string()]);
+        // RPC failing below 995: the active chain still finds 995; the fork's lookup fails.
         let hints = resume_hints(
             &tips,
             |h| h == "m995",
@@ -1309,7 +1330,7 @@ mod tests {
         )
         .await;
         assert_eq!(hints, vec!["m995".to_string()]);
-        // No active tip at all.
+        // No active tip at all: no hints, the caller falls back to its heads.
         assert!(resume_hints(
             &tips[1..],
             |_| true,
