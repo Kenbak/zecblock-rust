@@ -806,7 +806,12 @@ async fn run_capture_inner(
                 }
             }
             let _abort = Abort(reader.abort_handle());
-            let mut heartbeat = tokio::time::interval(Duration::from_secs(15));
+            // First tick after one period: a subscription's replay arrives right
+            // away, and a delivery at that moment would stall the reader.
+            let mut heartbeat = tokio::time::interval_at(
+                tokio::time::Instant::now() + Duration::from_secs(15),
+                Duration::from_secs(15),
+            );
             enum CaptureEvent {
                 Block(super::grpc::proto::BlockAndHash, u64),
                 Heartbeat,
@@ -823,8 +828,11 @@ async fn run_capture_inner(
                     CaptureEvent::Block(message, received) => (message, received),
                     CaptureEvent::Heartbeat => {
                         tokio::task::block_in_place(|| journal.save_health())?;
-                        if let Some(sink) = &sink {
-                            sink.try_flush(&mut journal).await?;
+                        // Journal queued blocks first; deliver on a quiet tick.
+                        if receiver.is_empty() {
+                            if let Some(sink) = &sink {
+                                sink.try_flush(&mut journal).await?;
+                            }
                         }
                         continue;
                     }
@@ -832,11 +840,19 @@ async fn run_capture_inner(
                 };
                 let evidence = decode(&message, received, receipt_session.clone())?;
                 let write_started = Instant::now();
-                if tokio::task::block_in_place(|| journal.store(evidence, &message.data))? {
+                let stored =
+                    tokio::task::block_in_place(|| journal.store(evidence, &message.data))?;
+                if stored {
                     new_blocks += 1;
                 }
-                if let Some(sink) = &sink {
-                    sink.try_flush(&mut journal).await?;
+                // One delivery is a multi-round-trip transaction (seconds from a
+                // distant observer). Deliver only after journaling something new
+                // and once queued blocks are journaled, so a burst is read at fsync
+                // speed. Anything still pending goes out on the next heartbeat.
+                if stored && receiver.is_empty() {
+                    if let Some(sink) = &sink {
+                        sink.try_flush(&mut journal).await?;
+                    }
                 }
                 persist_max_ms = persist_max_ms.max(write_started.elapsed().as_secs_f64() * 1000.0);
                 if !forced_reconnect && reconnect_after.is_some_and(|n| new_blocks >= n) {
