@@ -477,15 +477,19 @@ fn remember_recent(recent: &mut Vec<String>, hash: &str) {
 }
 
 /// Picks at most one resume hint per node chain so the node resends only
-/// blocks we are missing:
+/// blocks we are missing. Zakura stops every chain's replay walk at the first
+/// block whose hash is in the one hint set, whichever chain the hint came from,
+/// so a hint on the main chain also ends the main chain's walk:
+/// - the active chain: the newest captured main-chain block within
+///   `RESUME_HINT_WINDOW`, else no hint (the node resends that chain, under
+///   100 blocks; a drop part-way still journals a prefix, so the next resume
+///   has an active hint);
 /// - a chain whose tip we captured: the tip (nothing resent);
 /// - a fork whose tip we lack: the main-chain block at its fork point
-///   (`height - branchlen`), captured or not. The node then resends only the
-///   fork's own blocks; main-chain blocks we lack are resent by the active
-///   chain's walk, which covers every main-chain block;
-/// - the active chain: the newest captured main-chain block within
-///   `RESUME_HINT_WINDOW`, else no hint (the node resends that one chain,
-///   under 100 blocks, which fits its 200-block subscriber queue).
+///   (`height - branchlen`), only when that is at or below the active hint.
+///   A higher fork point would also stop the main chain's walk and silently
+///   skip the main-chain blocks between the active hint and it. Without one,
+///   the fork's walk runs down the shared prefix to the active hint instead.
 ///
 /// Zakura cannot look up fork blocks by hash over RPC, so only main-chain
 /// heights are queried. A failed lookup only costs that chain's hint.
@@ -508,27 +512,39 @@ where
     };
     let floor = best.saturating_sub(RESUME_HINT_WINDOW);
     let mut cache: HashMap<u64, Option<String>> = HashMap::new();
-    let mut hints: Vec<String> = Vec::new();
-    for tip in tips {
-        let hint = if captured(&tip.hash) {
-            Some(tip.hash.clone())
-        } else if tip.status != "active" {
-            let fork_point = tip.height.saturating_sub(tip.branchlen);
-            cached_main_hash(&mut cache, &mut main_hash_at, fork_point).await
+    // The active chain's resume point first: fork-point hints must not sit above it.
+    let mut active_hint: Option<(u64, String)> = None;
+    if let Some(active) = tips.iter().find(|t| t.status == "active") {
+        if captured(&active.hash) {
+            active_hint = Some((active.height, active.hash.clone()));
         } else {
-            let mut found = None;
-            let mut height = tip.height;
+            let mut height = active.height;
             while height >= floor {
                 match cached_main_hash(&mut cache, &mut main_hash_at, height).await {
                     Some(hash) if captured(&hash) => {
-                        found = Some(hash);
+                        active_hint = Some((height, hash));
                         break;
                     }
                     Some(_) if height > 0 => height -= 1,
                     _ => break,
                 }
             }
-            found
+        }
+    }
+    let mut hints: Vec<String> = Vec::new();
+    for tip in tips {
+        let hint = if tip.status == "active" {
+            active_hint.as_ref().map(|(_, hash)| hash.clone())
+        } else if captured(&tip.hash) {
+            Some(tip.hash.clone())
+        } else {
+            let fork_point = tip.height.saturating_sub(tip.branchlen);
+            match &active_hint {
+                Some((active_height, _)) if fork_point <= *active_height => {
+                    cached_main_hash(&mut cache, &mut main_hash_at, fork_point).await
+                }
+                _ => None,
+            }
         };
         if let Some(hint) = hint {
             if !hints.contains(&hint) {
@@ -1332,10 +1348,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resume_hints_name_fork_points_even_when_nothing_was_captured() {
-        // Fresh journal or long outage: nothing captured. Forks still get their
-        // fork point, so the node resends only their own blocks plus (with no
-        // active hint) the active chain once: under its 200-block queue.
+    async fn resume_hints_omit_fork_points_when_the_main_chain_has_no_hint() {
+        // Long outage: nothing captured within the window.
         let tips = vec![tip("t", "active", 1_000, 0), tip("f", "valid-fork", 990, 2)];
         let hints = resume_hints(
             &tips,
@@ -1343,7 +1357,9 @@ mod tests {
             |h| std::future::ready(Ok(format!("m{h}"))),
         )
         .await;
-        assert_eq!(hints, vec!["m988".to_string()]);
+        // Nothing captured on the main chain: no main-chain hint at all, since a
+        // fork point would also end the main chain's replay.
+        assert!(hints.is_empty());
         // RPC failing below 995: the active chain still finds 995; the fork's lookup fails.
         let hints = resume_hints(
             &tips,
@@ -1366,6 +1382,70 @@ mod tests {
         )
         .await
         .is_empty());
+    }
+
+    /// Zakura's first send (zakura-state `NonFinalizedBlocksListener::spawn`):
+    /// each chain is walked from its tip down until a hash in the one hint set.
+    fn zakura_replay(chains: &[Vec<String>], hints: &[String]) -> Vec<String> {
+        chains
+            .iter()
+            .flat_map(|chain| {
+                chain
+                    .iter()
+                    .rev()
+                    .take_while(|h| !hints.contains(h))
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn resume_hints_never_hide_main_chain_blocks_from_the_replay() {
+        // Main chain 900..=1000; we captured main up to `head`. Forks branch off
+        // with one block each at various heights, above and below `head`.
+        let main = main_chain(900, 1_000);
+        let main_hashes: Vec<String> = (900..=1_000).map(|h| format!("main{h}")).collect();
+        for head in [940_u64, 990, 999] {
+            for fork_points in [vec![994_u64], vec![930, 950, 997], vec![985, 992]] {
+                let mut chains = vec![main_hashes.clone()];
+                let mut tips = vec![tip("main1000", "active", 1_000, 0)];
+                for fp in &fork_points {
+                    let mut chain: Vec<String> = (900..=*fp).map(|h| format!("main{h}")).collect();
+                    chain.push(format!("fork{fp}"));
+                    chains.push(chain);
+                    tips.push(tip(&format!("fork{fp}"), "valid-fork", fp + 1, 1));
+                }
+                let captured = |h: &str| {
+                    h.strip_prefix("main")
+                        .and_then(|n| n.parse::<u64>().ok())
+                        .is_some_and(|n| n <= head)
+                };
+                let hints = resume_hints(&tips, captured, |h| {
+                    std::future::ready(main.get(&h).cloned().ok_or_else(|| "missing".into()))
+                })
+                .await;
+                let replay = zakura_replay(&chains, &hints);
+                for chain in &chains {
+                    for hash in chain.iter().filter(|h| !captured(h)) {
+                        assert!(
+                            replay.contains(hash),
+                            "head {head}, forks {fork_points:?}: {hash} not replayed (hints {hints:?})"
+                        );
+                    }
+                }
+                // Bounded: each chain resends at most its blocks above the head.
+                let bound: usize = chains
+                    .iter()
+                    .map(|c| c.iter().filter(|h| !captured(h)).count())
+                    .sum();
+                assert!(
+                    replay.len() <= bound,
+                    "head {head}: replay {}",
+                    replay.len()
+                );
+            }
+        }
     }
 
     #[test]
