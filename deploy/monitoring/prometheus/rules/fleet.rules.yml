@@ -300,12 +300,17 @@ groups:
           impact: "Competing (orphan) blocks are not being recorded at all, so orphan-rate numbers will have a gap."
           action: "Check the main server's database and network first, then the observer collectors."
       - alert: CaptureObserverPendingRecords
-        expr: zecblock_capture_observer_pending_records > 0
-        for: 15m
+        # A backlog that is shrinking is a recovery, not a fault: fire only when the
+        # pending count has not gone down over 15 minutes (stuck, or growing faster
+        # than it drains). A full journal is caught by the JournalFilling alerts.
+        expr: >
+          zecblock_capture_observer_pending_records > 0
+          and delta(zecblock_capture_observer_pending_records[15m]) >= 0
+        for: 10m
         labels: {severity: warning}
         annotations:
           title: "Observer data not reaching the database"
-          summary: "This observer has {{ $value }} saved records it has not been able to send to the database for 15 minutes."
+          summary: "This observer has {{ $value }} saved records and the backlog has not shrunk for 25 minutes."
           impact: "Nothing is lost yet (they are saved locally), but they are not counted on the site."
           action: "Check the observer can reach the database over WireGuard (wg show) and that PostgreSQL accepts it."
       - alert: CaptureObserverJournalFilling

@@ -25,6 +25,11 @@ const MAX_JOURNAL_BYTES_LIMIT: u64 = 16 * 1024 * 1024 * 1024;
 const MAX_RECORDS: usize = 4096;
 const MAX_RECENT_GAPS: usize = 32;
 const QUEUE_BLOCKS: usize = 8;
+/// Database delivery waits until the block stream has been quiet this long, so a
+/// burst (subscription replay, competing branch) is journaled at fsync speed
+/// before a delivery that can take seconds on a distant observer. Receipt times
+/// are taken when a block arrives, so deferring delivery does not move them.
+const FLUSH_SETTLE: Duration = Duration::from_secs(1);
 const MAX_META_BYTES: usize = 4096;
 const MAGIC: &[u8; 8] = b"CSCAP001";
 
@@ -664,19 +669,38 @@ async fn run_capture_inner(
             enum CaptureEvent {
                 Block(super::grpc::proto::BlockAndHash, u64),
                 Heartbeat,
+                Settled,
                 Closed,
             }
+            // Deliver once the stream is quiet, never between blocks of a burst:
+            // a slow delivery there fills the reader queue and drops the stream.
+            let mut flush_due: Option<tokio::time::Instant> = None;
             loop {
+                let settle = async move {
+                    match flush_due {
+                        Some(at) => tokio::time::sleep_until(at).await,
+                        None => std::future::pending::<()>().await,
+                    }
+                };
                 let event = tokio::select! {
+                    biased;
                     message = receiver.recv() => message
                         .map(|(message, received)| CaptureEvent::Block(message, received))
                         .unwrap_or(CaptureEvent::Closed),
+                    _ = settle => CaptureEvent::Settled,
                     _ = heartbeat.tick() => CaptureEvent::Heartbeat,
                 };
                 let (message, received) = match event {
                     CaptureEvent::Block(message, received) => (message, received),
-                    CaptureEvent::Heartbeat => {
-                        tokio::task::block_in_place(|| journal.save_health())?;
+                    tick @ (CaptureEvent::Heartbeat | CaptureEvent::Settled) => {
+                        if matches!(tick, CaptureEvent::Heartbeat) {
+                            tokio::task::block_in_place(|| journal.save_health())?;
+                        }
+                        // Blocks are waiting: let the reader drain them first.
+                        if !receiver.is_empty() {
+                            continue;
+                        }
+                        flush_due = None;
                         if let Some(sink) = &sink {
                             sink.try_flush(&mut journal).await?;
                         }
@@ -689,9 +713,7 @@ async fn run_capture_inner(
                 if tokio::task::block_in_place(|| journal.store(evidence, &message.data))? {
                     new_blocks += 1;
                 }
-                if let Some(sink) = &sink {
-                    sink.try_flush(&mut journal).await?;
-                }
+                flush_due = Some(tokio::time::Instant::now() + FLUSH_SETTLE);
                 persist_max_ms = persist_max_ms.max(write_started.elapsed().as_secs_f64() * 1000.0);
                 if !forced_reconnect && reconnect_after.is_some_and(|n| new_blocks >= n) {
                     forced_reconnect = true;
@@ -790,21 +812,27 @@ struct DatabaseSink {
 const MAX_FLUSH_BATCH: usize = 32;
 const DEFAULT_FLUSH_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// After this many consecutive full batches, retry a size that timed out before:
+/// load or latency may have improved. Costs at most one timeout per probe.
+const FLUSH_PROBE_AFTER: u32 = 16;
+
 /// Bounds one delivery transaction. Each record costs two round trips on top of
 /// about eight fixed ones, so on a distant observer (300+ ms to the primary) a
 /// full 32-record batch cannot finish inside the timeout. A fixed batch then
 /// never drains a backlog: every attempt times out and rolls back. The batch
-/// therefore halves after each timeout (down to one record) and doubles again
-/// after each successful full batch.
+/// therefore halves after each timeout (down to one record) and grows again
+/// after full batches, but it remembers the smallest size that timed out and
+/// only retries it after `FLUSH_PROBE_AFTER` consecutive full batches, instead of
+/// alternating between a working and a failing size.
 struct FlushControl {
-    batch: std::sync::atomic::AtomicUsize,
+    policy: std::sync::Mutex<FlushPolicy>,
     timeout: Duration,
 }
 
 impl Default for FlushControl {
     fn default() -> Self {
         Self {
-            batch: std::sync::atomic::AtomicUsize::new(MAX_FLUSH_BATCH),
+            policy: std::sync::Mutex::new(FlushPolicy::default()),
             timeout: DEFAULT_FLUSH_TIMEOUT,
         }
     }
@@ -819,6 +847,18 @@ impl FlushControl {
                     .as_deref(),
             ),
             ..Self::default()
+        }
+    }
+
+    fn batch(&self) -> usize {
+        self.policy.lock().map(|p| p.batch).unwrap_or(1)
+    }
+
+    /// Applies one outcome and returns the next batch size.
+    fn record(&self, outcome: FlushOutcome) -> usize {
+        match self.policy.lock() {
+            Ok(mut policy) => policy.record(outcome),
+            Err(_) => 1,
         }
     }
 }
@@ -841,13 +881,55 @@ enum FlushOutcome {
     Failed,
 }
 
-fn next_flush_batch(current: usize, outcome: FlushOutcome) -> usize {
-    let current = current.clamp(1, MAX_FLUSH_BATCH);
-    match outcome {
-        FlushOutcome::TimedOut => (current / 2).max(1),
-        // Only a full batch shows the limit was the constraint; a partial one is the whole backlog.
-        FlushOutcome::Delivered(n) if n >= current => (current * 2).min(MAX_FLUSH_BATCH),
-        FlushOutcome::Delivered(_) | FlushOutcome::Failed => current,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FlushPolicy {
+    batch: usize,
+    /// Smallest batch that timed out; `None` when no size is known to fail.
+    ceiling: Option<usize>,
+    /// Consecutive full batches since the last change.
+    streak: u32,
+}
+
+impl Default for FlushPolicy {
+    fn default() -> Self {
+        Self {
+            batch: MAX_FLUSH_BATCH,
+            ceiling: None,
+            streak: 0,
+        }
+    }
+}
+
+impl FlushPolicy {
+    fn record(&mut self, outcome: FlushOutcome) -> usize {
+        let current = self.batch.clamp(1, MAX_FLUSH_BATCH);
+        match outcome {
+            FlushOutcome::TimedOut => {
+                self.ceiling = Some(self.ceiling.map_or(current, |c| c.min(current)));
+                self.batch = (current / 2).max(1);
+                self.streak = 0;
+            }
+            // Only a full batch shows the limit was the constraint; a partial one is the whole backlog.
+            FlushOutcome::Delivered(n) if n >= current => {
+                self.streak = self.streak.saturating_add(1);
+                let larger = (current * 2).min(MAX_FLUSH_BATCH);
+                if larger > current {
+                    let known_to_fail = self.ceiling.is_some_and(|c| larger >= c);
+                    if !known_to_fail {
+                        self.batch = larger;
+                        self.streak = 0;
+                    } else if self.streak >= FLUSH_PROBE_AFTER {
+                        self.ceiling = None;
+                        self.batch = larger;
+                        self.streak = 0;
+                    }
+                }
+            }
+            FlushOutcome::Delivered(_) => {}
+            FlushOutcome::Failed => self.streak = 0,
+        }
+        self.batch = self.batch.clamp(1, MAX_FLUSH_BATCH);
+        self.batch
     }
 }
 
@@ -876,12 +958,7 @@ impl DatabaseSink {
     }
 
     async fn try_flush(&self, journal: &mut Journal) -> Result<(), String> {
-        use std::sync::atomic::Ordering;
-        let batch = self
-            .flush_control
-            .batch
-            .load(Ordering::Relaxed)
-            .clamp(1, MAX_FLUSH_BATCH);
+        let batch = self.flush_control.batch().clamp(1, MAX_FLUSH_BATCH);
         let (result, outcome) = match tokio::time::timeout(
             self.flush_control.timeout,
             self.flush(journal, batch),
@@ -903,10 +980,7 @@ impl DatabaseSink {
             }
             Err(_) => (Ok(()), FlushOutcome::TimedOut),
         };
-        let next = next_flush_batch(batch, outcome);
-        if next != batch {
-            self.flush_control.batch.store(next, Ordering::Relaxed);
-        }
+        let next = self.flush_control.record(outcome);
         if outcome == FlushOutcome::TimedOut {
             tracing::warn!(
                 batch,
@@ -1076,25 +1150,77 @@ mod tests {
     fn flush_batch_halves_on_timeout_and_recovers_on_full_batches() {
         use FlushOutcome::*;
         // A 32-record backlog at ~0.3 s per round trip times out; shrink to one record.
-        let mut batch = MAX_FLUSH_BATCH;
-        let mut seen = vec![batch];
-        while batch > 1 {
-            batch = next_flush_batch(batch, TimedOut);
-            seen.push(batch);
+        let mut p = FlushPolicy::default();
+        let mut seen = vec![p.batch];
+        while p.batch > 1 {
+            seen.push(p.record(TimedOut));
         }
         assert_eq!(seen, vec![32, 16, 8, 4, 2, 1]);
-        assert_eq!(next_flush_batch(1, TimedOut), 1);
+        assert_eq!(p.record(TimedOut), 1);
         // Other failures (connection refused, role limit) do not change the size.
-        assert_eq!(next_flush_batch(4, Failed), 4);
+        let mut p = FlushPolicy {
+            batch: 4,
+            ceiling: None,
+            streak: 0,
+        };
+        assert_eq!(p.record(Failed), 4);
         // A partial batch delivered the whole backlog: no evidence to grow.
-        assert_eq!(next_flush_batch(4, Delivered(1)), 4);
-        // Full batches double back to the cap.
-        assert_eq!(next_flush_batch(1, Delivered(1)), 2);
-        assert_eq!(next_flush_batch(16, Delivered(16)), 32);
-        assert_eq!(next_flush_batch(32, Delivered(32)), 32);
+        assert_eq!(p.record(Delivered(1)), 4);
+        // With no known failing size, full batches double back to the cap.
+        assert_eq!(p.record(Delivered(4)), 8);
+        assert_eq!(p.record(Delivered(8)), 16);
+        assert_eq!(p.record(Delivered(16)), 32);
+        assert_eq!(p.record(Delivered(32)), 32);
         // Out-of-range state is clamped.
-        assert_eq!(next_flush_batch(0, Failed), 1);
-        assert_eq!(next_flush_batch(500, Failed), MAX_FLUSH_BATCH);
+        let mut p = FlushPolicy {
+            batch: 0,
+            ceiling: None,
+            streak: 0,
+        };
+        assert_eq!(p.record(Failed), 1);
+        let mut p = FlushPolicy {
+            batch: 500,
+            ceiling: None,
+            streak: 0,
+        };
+        assert_eq!(p.record(Failed), MAX_FLUSH_BATCH);
+    }
+
+    #[test]
+    fn flush_batch_does_not_oscillate_into_a_size_that_timed_out() {
+        use FlushOutcome::*;
+        // SYD1, 2026-11-06: 16 timed out, 8 fit. The old policy went 8 -> 16 -> 8
+        // after every success, wasting a 10 s timeout per cycle.
+        let mut p = FlushPolicy::default();
+        p.record(TimedOut); // 32 -> 16
+        p.record(TimedOut); // 16 -> 8, ceiling 16
+        assert_eq!((p.batch, p.ceiling), (8, Some(16)));
+        for _ in 1..FLUSH_PROBE_AFTER {
+            assert_eq!(p.record(Delivered(8)), 8);
+        }
+        // Then one probe of the failing size.
+        assert_eq!(p.record(Delivered(8)), 16);
+        assert_eq!(p.ceiling, None);
+        // If the probe fails again the ceiling is restored and growth waits again.
+        assert_eq!(p.record(TimedOut), 8);
+        assert_eq!(p.ceiling, Some(16));
+        assert_eq!(p.record(Delivered(8)), 8);
+        // Sizes below the ceiling still grow at once (4 -> 8 after a deeper backoff).
+        let mut p = FlushPolicy {
+            batch: 4,
+            ceiling: Some(16),
+            streak: 0,
+        };
+        assert_eq!(p.record(Delivered(4)), 8);
+        assert_eq!(p.record(Delivered(8)), 8);
+        // A database failure resets the streak towards a probe.
+        let mut p = FlushPolicy {
+            batch: 8,
+            ceiling: Some(16),
+            streak: FLUSH_PROBE_AFTER - 1,
+        };
+        p.record(Failed);
+        assert_eq!(p.record(Delivered(8)), 8);
     }
 
     #[test]

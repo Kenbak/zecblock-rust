@@ -277,3 +277,32 @@ tests:
         alertname: HostTextfileStale
         exp_alerts: []
 
+
+  - name: pending records page only when the backlog is not draining
+    interval: 1m
+    input_series:
+      # Recovering: 540 records draining ~20/min (SYD1, 2026-11-06).
+      - series: 'zecblock_capture_observer_pending_records{network="mainnet",observer="do-syd1"}'
+        values: '540-20x26 0x20'
+      # Stuck: the count never goes down.
+      - series: 'zecblock_capture_observer_pending_records{network="mainnet",observer="do-nyc3"}'
+        values: '189x50'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: CaptureObserverPendingRecords
+        exp_alerts:
+          - exp_labels: {severity: warning, network: mainnet, observer: do-nyc3}
+            exp_annotations:
+              title: "Observer data not reaching the database"
+              summary: "This observer has 189 saved records and the backlog has not shrunk for 25 minutes."
+              impact: "Nothing is lost yet (they are saved locally), but they are not counted on the site."
+              action: "Check the observer can reach the database over WireGuard (wg show) and that PostgreSQL accepts it."
+      - eval_time: 40m
+        alertname: CaptureObserverPendingRecords
+        exp_alerts:
+          - exp_labels: {severity: warning, network: mainnet, observer: do-nyc3}
+            exp_annotations:
+              title: "Observer data not reaching the database"
+              summary: "This observer has 189 saved records and the backlog has not shrunk for 25 minutes."
+              impact: "Nothing is lost yet (they are saved locally), but they are not counted on the site."
+              action: "Check the observer can reach the database over WireGuard (wg show) and that PostgreSQL accepts it."
