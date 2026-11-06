@@ -27,6 +27,12 @@ const MAX_RECENT_GAPS: usize = 32;
 const QUEUE_BLOCKS: usize = 8;
 const MAX_META_BYTES: usize = 4096;
 const MAGIC: &[u8; 8] = b"CSCAP001";
+/// Hashes captured recently, kept after delivery so a reconnect can tell the
+/// node exactly which blocks we already have. Covers the non-finalized window
+/// (reorg limit 100) and its fork branches with margin.
+const MAX_RECENT_HASHES: usize = 512;
+/// How far below the best tip resume hints search the main chain.
+const RESUME_HINT_WINDOW: u64 = 120;
 
 fn now_ms() -> u64 {
     SystemTime::now()
@@ -127,6 +133,9 @@ struct Health {
     outage_reason: Option<String>,
     #[serde(default)]
     recent_gaps: Vec<GapInterval>,
+    /// Recently captured block hashes (delivered or not), oldest first.
+    #[serde(default)]
+    recent: Vec<String>,
 }
 
 struct Journal {
@@ -407,8 +416,20 @@ impl Journal {
             .retain(|hash, _| self.health.heads.contains(hash));
     }
 
+    fn remember(&mut self, hash: &str) {
+        remember_recent(&mut self.health.recent, hash);
+    }
+
+    /// Captured by this observer: still journaled, or recently delivered.
+    fn has_captured(&self, hash: &str) -> bool {
+        self.records.contains_key(hash) || self.health.recent.iter().any(|h| h == hash)
+    }
+
     fn store(&mut self, evidence: Evidence, raw: &[u8]) -> Result<bool, String> {
-        if self.records.contains_key(&evidence.hash) {
+        // A node replay of a block we already captured adds nothing: its first
+        // receipt is journaled or in the database, keyed by (observer, hash).
+        // Re-journaling it would only rebuild a delivery backlog.
+        if self.has_captured(&evidence.hash) {
             return Ok(false);
         }
         let metadata = serde_json::to_vec(&evidence).map_err(|e| e.to_string())?;
@@ -439,10 +460,101 @@ impl Journal {
         }
         self.bytes += size;
         self.advance_head(&evidence);
+        self.remember(&evidence.hash);
         self.records.insert(evidence.hash.clone(), evidence);
         self.save_health()?;
         Ok(true)
     }
+}
+
+/// Appends `hash` once, keeping the newest `MAX_RECENT_HASHES`.
+fn remember_recent(recent: &mut Vec<String>, hash: &str) {
+    if !recent.iter().any(|h| h == hash) {
+        recent.push(hash.to_owned());
+        let excess = recent.len().saturating_sub(MAX_RECENT_HASHES);
+        recent.drain(..excess);
+    }
+}
+
+/// Picks at most one resume hint per node chain so the node resends only
+/// blocks we are missing:
+/// - a chain whose tip we captured: the tip (nothing resent);
+/// - a fork whose tip we lack: the main-chain block at its fork point
+///   (`height - branchlen`), captured or not. The node then resends only the
+///   fork's own blocks; main-chain blocks we lack are resent by the active
+///   chain's walk, which covers every main-chain block;
+/// - the active chain: the newest captured main-chain block within
+///   `RESUME_HINT_WINDOW`, else no hint (the node resends that one chain,
+///   under 100 blocks, which fits its 200-block subscriber queue).
+///
+/// Zakura cannot look up fork blocks by hash over RPC, so only main-chain
+/// heights are queried. A failed lookup only costs that chain's hint.
+async fn resume_hints<F, Fut>(
+    tips: &[super::rpc::ChainTip],
+    captured: impl Fn(&str) -> bool,
+    mut main_hash_at: F,
+) -> Vec<String>
+where
+    F: FnMut(u64) -> Fut,
+    Fut: std::future::Future<Output = Result<String, String>>,
+{
+    let Some(best) = tips
+        .iter()
+        .filter(|t| t.status == "active")
+        .map(|t| t.height)
+        .max()
+    else {
+        return Vec::new();
+    };
+    let floor = best.saturating_sub(RESUME_HINT_WINDOW);
+    let mut cache: HashMap<u64, Option<String>> = HashMap::new();
+    let mut hints: Vec<String> = Vec::new();
+    for tip in tips {
+        let hint = if captured(&tip.hash) {
+            Some(tip.hash.clone())
+        } else if tip.status != "active" {
+            let fork_point = tip.height.saturating_sub(tip.branchlen);
+            cached_main_hash(&mut cache, &mut main_hash_at, fork_point).await
+        } else {
+            let mut found = None;
+            let mut height = tip.height;
+            while height >= floor {
+                match cached_main_hash(&mut cache, &mut main_hash_at, height).await {
+                    Some(hash) if captured(&hash) => {
+                        found = Some(hash);
+                        break;
+                    }
+                    Some(_) if height > 0 => height -= 1,
+                    _ => break,
+                }
+            }
+            found
+        };
+        if let Some(hint) = hint {
+            if !hints.contains(&hint) {
+                hints.push(hint);
+            }
+        }
+    }
+    hints.truncate(zakura_chain::parameters::MAX_NON_FINALIZED_CHAIN_FORKS);
+    hints
+}
+
+async fn cached_main_hash<F, Fut>(
+    cache: &mut HashMap<u64, Option<String>>,
+    main_hash_at: &mut F,
+    height: u64,
+) -> Option<String>
+where
+    F: FnMut(u64) -> Fut,
+    Fut: std::future::Future<Output = Result<String, String>>,
+{
+    if let Some(hash) = cache.get(&height) {
+        return hash.clone();
+    }
+    let hash = main_hash_at(height).await.ok();
+    cache.insert(height, hash.clone());
+    hash
 }
 
 #[derive(Serialize)]
@@ -572,7 +684,8 @@ async fn run_capture_inner(
             // Keep even old resume hints: unrecognized hashes cause retained
             // history to replay. Clearing them and taking a fresh baseline here
             // would instead skip blocks the node can still recover after an outage.
-            if journal.health.heads.is_empty() {
+            let baselined = journal.health.heads.is_empty();
+            if baselined {
                 // Explicit initial baseline, not an assertion of past capture.
                 let mut tips = rpc.get_fork_tip_hashes().await?;
                 let mut stream = client
@@ -597,10 +710,43 @@ async fn run_capture_inner(
             {
                 return Err("capture resume heads exceed node fork limit".into());
             }
-            let heads = journal
-                .health
-                .heads
+            // Tell the node, per chain it holds, the newest block we already have,
+            // so it resends only what we are missing. Our own head list names tips
+            // only; for a fork whose tip we lack the node would otherwise resend
+            // the fork plus the whole main chain below it (~100 blocks), and a few
+            // such forks fill its 200-block subscriber queue, which drops us at
+            // once and repeats on every reconnect. Fall back to our heads if the
+            // node cannot be asked.
+            // A fresh baseline is already exactly the node's tips: resume hints would
+            // instead replay retained history that this observer never received.
+            let hints = if baselined {
+                Vec::new()
+            } else {
+                match rpc.get_chain_tips().await {
+                    Ok(tips) => {
+                        resume_hints(
+                            &tips,
+                            // Our own heads count as known: they are the tips we
+                            // last stored (or baselined), so a walk may stop there.
+                            |hash| {
+                                journal.has_captured(hash)
+                                    || journal.health.heads.iter().any(|h| h == hash)
+                            },
+                            |height| rpc.get_block_hash(height),
+                        )
+                        .await
+                    }
+                    Err(_) => Vec::new(),
+                }
+            };
+            let hint_list = if hints.is_empty() {
+                journal.health.heads.clone()
+            } else {
+                hints
+            };
+            let heads = hint_list
                 .iter()
+                .take(zakura_chain::parameters::MAX_NON_FINALIZED_CHAIN_FORKS)
                 .map(hex::decode)
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|_| "capture checkpoint hash malformed")?;
@@ -660,7 +806,12 @@ async fn run_capture_inner(
                 }
             }
             let _abort = Abort(reader.abort_handle());
-            let mut heartbeat = tokio::time::interval(Duration::from_secs(15));
+            // First tick after one period: a subscription's replay arrives right
+            // away, and a delivery at that moment would stall the reader.
+            let mut heartbeat = tokio::time::interval_at(
+                tokio::time::Instant::now() + Duration::from_secs(15),
+                Duration::from_secs(15),
+            );
             enum CaptureEvent {
                 Block(super::grpc::proto::BlockAndHash, u64),
                 Heartbeat,
@@ -677,8 +828,11 @@ async fn run_capture_inner(
                     CaptureEvent::Block(message, received) => (message, received),
                     CaptureEvent::Heartbeat => {
                         tokio::task::block_in_place(|| journal.save_health())?;
-                        if let Some(sink) = &sink {
-                            sink.try_flush(&mut journal).await?;
+                        // Journal queued blocks first; deliver on a quiet tick.
+                        if receiver.is_empty() {
+                            if let Some(sink) = &sink {
+                                sink.try_flush(&mut journal).await?;
+                            }
                         }
                         continue;
                     }
@@ -686,11 +840,19 @@ async fn run_capture_inner(
                 };
                 let evidence = decode(&message, received, receipt_session.clone())?;
                 let write_started = Instant::now();
-                if tokio::task::block_in_place(|| journal.store(evidence, &message.data))? {
+                let stored =
+                    tokio::task::block_in_place(|| journal.store(evidence, &message.data))?;
+                if stored {
                     new_blocks += 1;
                 }
-                if let Some(sink) = &sink {
-                    sink.try_flush(&mut journal).await?;
+                // One delivery is a multi-round-trip transaction (seconds from a
+                // distant observer). Deliver only after journaling something new
+                // and once queued blocks are journaled, so a burst is read at fsync
+                // speed. Anything still pending goes out on the next heartbeat.
+                if stored && receiver.is_empty() {
+                    if let Some(sink) = &sink {
+                        sink.try_flush(&mut journal).await?;
+                    }
                 }
                 persist_max_ms = persist_max_ms.max(write_started.elapsed().as_secs_f64() * 1000.0);
                 if !forced_reconnect && reconnect_after.is_some_and(|n| new_blocks >= n) {
@@ -1124,6 +1286,102 @@ impl DatabaseSink {
 mod tests {
     use super::*;
 
+    fn tip(hash: &str, status: &str, height: u64, branchlen: u64) -> super::super::rpc::ChainTip {
+        super::super::rpc::ChainTip {
+            hash: hash.into(),
+            status: status.into(),
+            height,
+            branchlen,
+        }
+    }
+
+    fn main_chain(lo: u64, hi: u64) -> HashMap<u64, String> {
+        (lo..=hi).map(|h| (h, format!("main{h}"))).collect()
+    }
+
+    #[tokio::test]
+    async fn resume_hints_name_the_newest_captured_block_per_chain() {
+        // SYD1 2026-11-06: active tip plus fork tips of branchlen 1, most never captured.
+        let main = main_chain(3_544_800, 3_544_986);
+        let tips = vec![
+            tip("main3544986", "active", 3_544_986, 0),
+            tip("forkA", "valid-fork", 3_544_912, 1),
+            tip("forkB", "valid-fork", 3_544_879, 1),
+            tip("forkC", "valid-fork", 3_544_874, 1),
+        ];
+        // Captured: forkA, and the main chain up to 3_544_984 (missed the last two).
+        let captured = |h: &str| {
+            h == "forkA"
+                || h.strip_prefix("main")
+                    .and_then(|n| n.parse::<u64>().ok())
+                    .is_some_and(|n| n <= 3_544_984)
+        };
+        let hints = resume_hints(&tips, captured, |h| {
+            std::future::ready(main.get(&h).cloned().ok_or_else(|| "missing".to_string()))
+        })
+        .await;
+        assert_eq!(
+            hints,
+            vec![
+                "main3544984".to_string(), // node resends 3_544_985..986 only
+                "forkA".into(),            // tip captured: nothing resent
+                "main3544878".into(),      // fork point: only forkB resent
+                "main3544873".into(),      // only forkC resent
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_hints_name_fork_points_even_when_nothing_was_captured() {
+        // Fresh journal or long outage: nothing captured. Forks still get their
+        // fork point, so the node resends only their own blocks plus (with no
+        // active hint) the active chain once: under its 200-block queue.
+        let tips = vec![tip("t", "active", 1_000, 0), tip("f", "valid-fork", 990, 2)];
+        let hints = resume_hints(
+            &tips,
+            |_| false,
+            |h| std::future::ready(Ok(format!("m{h}"))),
+        )
+        .await;
+        assert_eq!(hints, vec!["m988".to_string()]);
+        // RPC failing below 995: the active chain still finds 995; the fork's lookup fails.
+        let hints = resume_hints(
+            &tips,
+            |h| h == "m995",
+            |h| {
+                std::future::ready(if h >= 995 {
+                    Ok(format!("m{h}"))
+                } else {
+                    Err("rpc".into())
+                })
+            },
+        )
+        .await;
+        assert_eq!(hints, vec!["m995".to_string()]);
+        // No active tip at all: no hints, the caller falls back to its heads.
+        assert!(resume_hints(
+            &tips[1..],
+            |_| true,
+            |_| std::future::ready(Ok(String::new()))
+        )
+        .await
+        .is_empty());
+    }
+
+    #[test]
+    fn recent_hashes_suppress_replayed_blocks_and_stay_bounded() {
+        let mut health = Health::default();
+        for i in 0..(MAX_RECENT_HASHES + 10) {
+            remember_recent(&mut health.recent, &format!("{i:064x}"));
+            remember_recent(&mut health.recent, &format!("{i:064x}")); // duplicate is a no-op
+        }
+        assert_eq!(health.recent.len(), MAX_RECENT_HASHES);
+        assert_eq!(health.recent[0], format!("{:064x}", 10));
+        // Older health files without the field still load.
+        let old: Health = serde_json::from_str(r#"{"network":"mainnet","started_at_ms":0,"updated_at_ms":0,"connected":false,"coverage":"","gaps":0,"last_gap":null,"last_gap_at_ms":null,"connections":0,"heads":[],"receipt_session":null}"#).unwrap();
+        assert!(old.recent.is_empty());
+    }
+
     #[test]
     fn flush_batch_halves_on_timeout_and_recovers_on_full_batches() {
         use FlushOutcome::*;
@@ -1262,7 +1520,9 @@ mod tests {
         let mut replay = evidence.clone();
         replay.received_at_ms = 9000;
         replay.receipt_session = Some("session-two".into());
-        journal.store(replay, &message.data).unwrap();
+        // Recently delivered: the node's replay is not journaled again.
+        assert!(!journal.store(replay, &message.data).unwrap());
+        assert!(journal.records.is_empty());
         sink.flush(&mut journal, MAX_FLUSH_BATCH).await.unwrap();
         let count: i64 = sqlx::query_scalar("SELECT count(*) FROM captured_blocks")
             .fetch_one(&sink.pool)
