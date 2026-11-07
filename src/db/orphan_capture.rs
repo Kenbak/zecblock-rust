@@ -1618,29 +1618,23 @@ mod tests {
         // first held its lock through a multi-round-trip transaction, and the
         // others' 500 ms lock_timeout expired behind it (114-460 per hour).
         let url = std::env::var("DATABASE_URL").expect("disposable DATABASE_URL required");
-        let options = url
-            .parse::<sqlx::postgres::PgConnectOptions>()
-            .unwrap()
-            .options([("search_path", "capture_lock_test")]);
+        // Real (migrated) tables: the stall needs a second session to see the row.
+        // Other database tests use session-local TEMP tables, so nothing else here
+        // writes these; everything this test adds is removed at the end.
         let admin = PgPoolOptions::new()
             .max_connections(2)
-            .connect_with(options.clone())
+            .connect(&url)
             .await
             .unwrap();
-        sqlx::raw_sql("DROP SCHEMA IF EXISTS capture_lock_test CASCADE; CREATE SCHEMA capture_lock_test;
-            CREATE TABLE blocks(height bigint PRIMARY KEY, hash text UNIQUE);
-            CREATE TABLE captured_blocks(hash text PRIMARY KEY,network text,height bigint,previous_block_hash text,timestamp bigint,first_seen_at timestamptz,miner_address text,coinbase_hex text,raw_block bytea,raw_pruned boolean DEFAULT false);
-            CREATE TABLE block_capture_observers(observer text PRIMARY KEY,network text,collection_started_at timestamptz DEFAULT now(),heartbeat_at timestamptz DEFAULT now(),stream_connected boolean,gaps bigint,pending_records integer,last_gap text,last_gap_at timestamptz);
-            CREATE TABLE block_capture_receipts(observer text, hash text REFERENCES captured_blocks(hash),received_at timestamptz,receipt_session text,receipt_order bigint,PRIMARY KEY(observer,hash));
-            INSERT INTO blocks VALUES (0,'00040fe8ec8471911baa1db1266ea15dd06b4a8a5c453883c000b031973dce08')")
-            .execute(&admin).await.unwrap();
+        let added_genesis: Option<i64> = sqlx::query_scalar("INSERT INTO blocks (height,hash,timestamp) VALUES (0,'00040fe8ec8471911baa1db1266ea15dd06b4a8a5c453883c000b031973dce08',0) ON CONFLICT DO NOTHING RETURNING height")
+            .fetch_optional(&admin).await.unwrap();
         let sink = std::sync::Arc::new(DatabaseSink {
             pool: PgPoolOptions::new()
                 .max_connections(1)
-                .connect_with(options)
+                .connect(&url)
                 .await
                 .unwrap(),
-            observer: "distant".into(),
+            observer: "lock-test-distant".into(),
             network: "mainnet".into(),
             coverage_schema: Default::default(),
             flush_control: Default::default(),
@@ -1692,7 +1686,7 @@ mod tests {
             .bind(500.0_f64)
             .bind(None::<String>)
             .bind(None::<String>)
-            .bind(None::<Vec<u8>>)
+            .bind(&message.data)
             .execute(&mut *other)
             .await
             .expect("the shared block row must not stay locked by another observer's delivery");
@@ -1705,17 +1699,32 @@ mod tests {
             sink.flush(&mut journal, MAX_FLUSH_BATCH).await.unwrap();
         }
         assert!(journal.records.is_empty());
-        let (receipts, first_seen): (i64, f64) = sqlx::query_as("SELECT (SELECT count(*) FROM block_capture_receipts WHERE observer='distant' AND hash=$1), extract(epoch FROM first_seen_at)::float8 FROM captured_blocks WHERE hash=$1")
+        let (receipts, first_seen): (i64, f64) = sqlx::query_as("SELECT (SELECT count(*) FROM block_capture_receipts WHERE observer='lock-test-distant' AND hash=$1), extract(epoch FROM first_seen_at)::float8 FROM captured_blocks WHERE hash=$1")
             .bind(&evidence.hash)
             .fetch_one(&admin)
             .await
             .unwrap();
         assert_eq!(receipts, 1);
         assert_eq!(first_seen, 0.5, "the earliest sighting wins");
-        sqlx::raw_sql("DROP SCHEMA capture_lock_test CASCADE")
+        sqlx::query("DELETE FROM block_capture_receipts WHERE observer='lock-test-distant'")
             .execute(&admin)
             .await
             .unwrap();
+        sqlx::query("DELETE FROM block_capture_observers WHERE observer='lock-test-distant'")
+            .execute(&admin)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM captured_blocks WHERE hash=$1")
+            .bind(&evidence.hash)
+            .execute(&admin)
+            .await
+            .unwrap();
+        if added_genesis.is_some() {
+            sqlx::query("DELETE FROM blocks WHERE height=0")
+                .execute(&admin)
+                .await
+                .unwrap();
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
