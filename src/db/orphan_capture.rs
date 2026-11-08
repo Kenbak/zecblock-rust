@@ -1163,10 +1163,7 @@ impl DatabaseSink {
     }
 
     /// Migration 042 adds coverage columns; older schemas keep the 035 contract.
-    async fn has_coverage_schema(
-        &self,
-        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    ) -> Result<bool, String> {
+    async fn has_coverage_schema(&self) -> Result<bool, String> {
         use std::sync::atomic::Ordering;
         match self.coverage_schema.load(Ordering::Relaxed) {
             1 => return Ok(true),
@@ -1175,7 +1172,7 @@ impl DatabaseSink {
         }
         // Check the exact columns the UPDATE writes, on the relation it resolves to.
         let present: bool = sqlx::query_scalar(COVERAGE_COLUMNS_SQL)
-            .fetch_one(&mut **tx)
+            .fetch_one(&self.pool)
             .await
             .map_err(|_| "capture database identity")?;
         self.coverage_schema
@@ -1289,6 +1286,30 @@ impl DatabaseSink {
                 .await
                 .map_err(|_| "capture database block")?;
         }
+        // This observer's health row, also written by its coverage audit (another
+        // connection): autocommit statements, so the row lock lasts one server-side
+        // statement. Inside the receipts transaction it was held for several round
+        // trips from a distant observer, and the audit's 500 ms lock_timeout expired
+        // behind it every time the two periods lined up (SYD1, 2026-11-07). Written
+        // before the receipts, whose foreign key needs the row; `pending_records`
+        // assumes this batch lands, and the next delivery corrects it if not.
+        sqlx::query("INSERT INTO block_capture_observers (observer,network,stream_connected,gaps,pending_records,last_gap,last_gap_at) VALUES ($1,$2,$3,$4,$5,$6,to_timestamp($7::double precision / 1000)) ON CONFLICT(observer) DO UPDATE SET heartbeat_at=now(),stream_connected=EXCLUDED.stream_connected,gaps=EXCLUDED.gaps,pending_records=EXCLUDED.pending_records,last_gap=EXCLUDED.last_gap,last_gap_at=EXCLUDED.last_gap_at WHERE block_capture_observers.network=EXCLUDED.network")
+            .bind(&self.observer).bind(&self.network).bind(journal.health.connected)
+            .bind(journal.health.gaps as i64).bind((journal.records.len()-records.len()) as i32)
+            .bind(&journal.health.last_gap).bind(journal.health.last_gap_at_ms.map(|v|v as f64))
+            .execute(&self.pool).await.map_err(|_| "capture database observer")?;
+        if self.has_coverage_schema().await? {
+            let gaps = serde_json::to_string(&journal.health.recent_gaps)
+                .map_err(|_| "capture health encoding")?;
+            sqlx::query("UPDATE block_capture_observers SET coverage_since=COALESCE(coverage_since, now()), unobserved_ms=$2, outage_since=to_timestamp($3::double precision/1000), recent_gaps=$4::jsonb, pending_bytes=$5, journal_max_bytes=$6 WHERE observer=$1")
+                .bind(&self.observer)
+                .bind(i64::try_from(journal.health.unobserved_ms).unwrap_or(i64::MAX))
+                .bind(journal.health.outage_since_ms.map(|v| v as f64))
+                .bind(gaps)
+                .bind(i64::try_from(journal.bytes).unwrap_or(i64::MAX))
+                .bind(i64::try_from(journal.max_bytes).unwrap_or(i64::MAX))
+                .execute(&self.pool).await.map_err(|_| "capture database observer coverage")?;
+        }
         let mut tx = self
             .pool
             .begin()
@@ -1302,23 +1323,6 @@ impl DatabaseSink {
             .execute(&mut *tx)
             .await
             .map_err(|_| "capture database setup")?;
-        sqlx::query("INSERT INTO block_capture_observers (observer,network,stream_connected,gaps,pending_records,last_gap,last_gap_at) VALUES ($1,$2,$3,$4,$5,$6,to_timestamp($7::double precision / 1000)) ON CONFLICT(observer) DO UPDATE SET heartbeat_at=now(),stream_connected=EXCLUDED.stream_connected,gaps=EXCLUDED.gaps,pending_records=EXCLUDED.pending_records,last_gap=EXCLUDED.last_gap,last_gap_at=EXCLUDED.last_gap_at WHERE block_capture_observers.network=EXCLUDED.network")
-            .bind(&self.observer).bind(&self.network).bind(journal.health.connected)
-            .bind(journal.health.gaps as i64).bind((journal.records.len()-records.len()) as i32)
-            .bind(&journal.health.last_gap).bind(journal.health.last_gap_at_ms.map(|v|v as f64))
-            .execute(&mut *tx).await.map_err(|_| "capture database observer")?;
-        if self.has_coverage_schema(&mut tx).await? {
-            let gaps = serde_json::to_string(&journal.health.recent_gaps)
-                .map_err(|_| "capture health encoding")?;
-            sqlx::query("UPDATE block_capture_observers SET coverage_since=COALESCE(coverage_since, now()), unobserved_ms=$2, outage_since=to_timestamp($3::double precision/1000), recent_gaps=$4::jsonb, pending_bytes=$5, journal_max_bytes=$6 WHERE observer=$1")
-                .bind(&self.observer)
-                .bind(i64::try_from(journal.health.unobserved_ms).unwrap_or(i64::MAX))
-                .bind(journal.health.outage_since_ms.map(|v| v as f64))
-                .bind(gaps)
-                .bind(i64::try_from(journal.bytes).unwrap_or(i64::MAX))
-                .bind(i64::try_from(journal.max_bytes).unwrap_or(i64::MAX))
-                .execute(&mut *tx).await.map_err(|_| "capture database observer coverage")?;
-        }
         for evidence in &records {
             sqlx::query("INSERT INTO block_capture_receipts (observer,hash,received_at,receipt_session,receipt_order) VALUES ($1,$2,to_timestamp($3::double precision/1000),$4,$5) ON CONFLICT(observer,hash) DO NOTHING")
                 .bind(&self.observer).bind(&evidence.hash).bind(evidence.received_at_ms as f64)
@@ -1613,7 +1617,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_stalled_delivery_does_not_hold_the_shared_block_row() {
+    async fn a_stalled_delivery_does_not_hold_shared_or_health_rows() {
         // Live 2026-11-06: nine collectors insert the same captured_blocks row; the
         // first held its lock through a multi-round-trip transaction, and the
         // others' 500 ms lock_timeout expired behind it (114-460 per hour).
@@ -1690,6 +1694,13 @@ mod tests {
             .execute(&mut *other)
             .await
             .expect("the shared block row must not stay locked by another observer's delivery");
+        // The observer's own coverage audit (another connection) records its result
+        // on the health row meanwhile; it used to time out behind the delivery.
+        let audited = sqlx::query("UPDATE block_capture_observers SET audit_checked_at = now(), audit_status = 'ok' WHERE observer = 'lock-test-distant'")
+            .execute(&mut *other)
+            .await
+            .expect("the observer health row must not stay locked by its own delivery");
+        assert_eq!(audited.rows_affected(), 1);
         stall.rollback().await.unwrap();
         drop(other);
 
