@@ -21,6 +21,10 @@ use crate::models::{Transaction, TransparentInput, TransparentOutput};
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 
+/// Rollback removes every height at or above the fork, so rollback tests must
+/// not run while another one has rows in the database.
+static ROLLBACK_TESTS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 async fn test_pool() -> PgPool {
     let url = std::env::var("DATABASE_URL")
         .expect("DATABASE_URL must be set to a disposable test database");
@@ -352,6 +356,7 @@ async fn disjoint_addresses_both_update_correctly_when_concurrent() {
 /// orphaned_blocks.
 #[tokio::test]
 async fn reorg_rollback_removes_orphaned_rows_and_recomputes_summary() {
+    let _serial = ROLLBACK_TESTS.lock().await;
     let pool = test_pool().await;
     let w = writer().await;
     let (from, to) = (90_000_300u32, 90_000_302u32);
@@ -509,6 +514,7 @@ async fn has_shielded_data_reflects_actual_shielded_activity() {
 /// Collector timestamps remain immutable across polls, replay and archival.
 #[tokio::test]
 async fn first_observation_and_raw_orphan_evidence_survive_rollback() {
+    let _serial = ROLLBACK_TESTS.lock().await;
     let pool = test_pool().await;
     let w = writer().await;
     let height = 90_001_000u32;
@@ -623,4 +629,110 @@ async fn first_observation_and_raw_orphan_evidence_survive_rollback() {
         .execute(&pool)
         .await
         .unwrap();
+}
+
+/// A reorg at the node's full rollback limit must commit as one transaction and
+/// leave the surviving block and its address summary intact.
+#[tokio::test]
+async fn rollback_at_the_node_limit_archives_every_orphaned_block() {
+    let _serial = ROLLBACK_TESTS.lock().await;
+    const DEPTH: u32 = 1000;
+    let pool = test_pool().await;
+    let w = writer().await;
+    let base = 90_100_000u32;
+    let (fork, tip) = (base + 1, base + DEPTH);
+    let miner = "tTEST1deepreorgminer00000000000000";
+    let block_hash = |height: u32| format!("{height:064x}");
+    let txid = |height: u32| format!("cb{height:062x}");
+    let hashes: Vec<String> = (base..=tip).map(block_hash).collect();
+    let txids: Vec<String> = (base..=tip).map(txid).collect();
+    let clear_archives = || async {
+        for sql in [
+            "DELETE FROM orphaned_transaction_inputs WHERE block_hash = ANY($1)",
+            "DELETE FROM orphaned_transaction_outputs WHERE block_hash = ANY($1)",
+            "DELETE FROM orphaned_transactions WHERE block_hash = ANY($1)",
+        ] {
+            sqlx::query(sql).bind(&hashes).execute(&pool).await.unwrap();
+        }
+    };
+    clear_archives().await;
+    cleanup(&pool, base, tip, &[miner]).await;
+    for sql in [
+        "DELETE FROM transaction_outputs WHERE txid = ANY($1)",
+        "DELETE FROM transaction_inputs WHERE txid = ANY($1)",
+    ] {
+        sqlx::query(sql).bind(&txids).execute(&pool).await.unwrap();
+    }
+
+    const REWARD: i64 = 26_041_666;
+    for height in base..=tip {
+        let hash = block_hash(height);
+        let time = 1_800_000_000 + u64::from(height - base) * 25;
+        let tx = coinbase_tx(&txid(height), height, &hash, miner, REWARD);
+        w.batch_insert_with_header_and_flows(height, &hash, time, &[tx], &[], &header(time))
+            .await
+            .expect("insert failed");
+    }
+
+    // Partial evidence is the expected shape once the capture budget is reached.
+    let raw: Vec<(String, String)> = (fork..fork + 10)
+        .map(|height| (block_hash(height), "aabbccdd".to_string()))
+        .collect();
+    let started = std::time::Instant::now();
+    let rolled_back = w
+        .rollback_from_height_with_raw(fork, "deep reorg regression", &raw)
+        .await
+        .expect("rollback failed");
+    println!(
+        "rolled back {rolled_back} blocks in {} ms",
+        started.elapsed().as_millis()
+    );
+    assert_eq!(rolled_back, DEPTH);
+
+    let count = |sql: &'static str| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, i64>(sql)
+                .bind(i64::from(base))
+                .bind(i64::from(tip))
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+        }
+    };
+    assert_eq!(
+        count("SELECT count(*) FROM blocks WHERE height BETWEEN $1 AND $2").await,
+        1
+    );
+    assert_eq!(
+        count("SELECT count(*) FROM transactions WHERE block_height BETWEEN $1 AND $2").await,
+        1
+    );
+    assert_eq!(
+        count("SELECT count(*) FROM orphaned_blocks WHERE height BETWEEN $1 AND $2").await,
+        i64::from(DEPTH)
+    );
+    assert_eq!(
+        count("SELECT count(*) FROM orphaned_blocks WHERE height BETWEEN $1 AND $2 AND raw_hex IS NOT NULL").await,
+        10
+    );
+    assert_eq!(
+        count("SELECT count(*) FROM orphaned_transactions WHERE block_height BETWEEN $1 AND $2")
+            .await,
+        i64::from(DEPTH)
+    );
+    let depth: i32 = sqlx::query_scalar("SELECT depth FROM fork_events WHERE fork_height = $1")
+        .bind(i64::from(fork))
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(depth, DEPTH as i32);
+    assert_eq!(
+        address_row(&pool, miner).await,
+        Some((REWARD, REWARD, 0, 1)),
+        "the surviving block alone must remain in the address summary"
+    );
+
+    clear_archives().await;
+    cleanup(&pool, base, tip, &[miner]).await;
 }

@@ -216,21 +216,28 @@ impl Indexer {
         // Capture orphan bytes from RPC when still available, otherwise use the
         // bounded recent-block spool written before the reorg was observed.
         let mut raw_blocks: Vec<(String, String)> = Vec::new();
+        let mut capture_budget = reorg::RawCaptureBudget::new(reorg::MAX_RAW_ORPHAN_HEX_BYTES);
         for h in fork_height..=last_indexed {
+            if capture_budget.is_exhausted() {
+                println!(
+                    "   ⚠️ Raw orphan capture budget reached at height {h}; heights {h}-{last_indexed} are archived without raw bytes"
+                );
+                break;
+            }
             let hash = self
                 .postgres
                 .get_block_hash_at_height(h)
                 .await
                 .map_err(|e| format!("DB read error at {h}: {e}"))?;
             if let Some(hash) = hash {
-                match rpc.get_raw_block_hex(&hash).await {
+                let raw_hex = match rpc.get_raw_block_hex(&hash).await {
                     Ok(hex) => {
                         println!(
                             "   📦 Captured raw orphan block {} ({} bytes)",
                             h,
                             hex.len() / 2
                         );
-                        raw_blocks.push((hash, hex));
+                        Some(hex)
                     }
                     Err(rpc_error) => match self.block_spool.read(h, &hash).await {
                         Ok(Some(bytes)) => {
@@ -239,21 +246,28 @@ impl Indexer {
                                 h,
                                 bytes.len()
                             );
-                            raw_blocks.push((hash, hex::encode(bytes)));
+                            Some(hex::encode(bytes))
                         }
                         Ok(None) => {
                             println!(
                                 "   ⚠️ Orphan block {} unavailable via RPC or bounded spool: {}",
                                 h, rpc_error
                             );
+                            None
                         }
                         Err(spool_error) => {
                             println!(
                                 "   ⚠️ Orphan block {} unavailable via RPC ({}); spool error: {}",
                                 h, rpc_error, spool_error
                             );
+                            None
                         }
                     },
+                };
+                if let Some(raw_hex) = raw_hex {
+                    if capture_budget.admit(raw_hex.len()) {
+                        raw_blocks.push((hash, raw_hex));
+                    }
                 }
             }
         }
