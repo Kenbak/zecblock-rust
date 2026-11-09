@@ -29,8 +29,8 @@ pub struct Config {
     pub live_poll_interval_secs: u64,
 
     /// Maximum reorg depth the indexer will handle automatically.
-    /// Reorgs deeper than this require manual intervention (mainnet safety).
-    /// Testnet should use a higher value since deep reorgs are routine.
+    /// The default matches Zakura's MAX_BLOCK_REORG_HEIGHT, so any branch the
+    /// node can still switch to is also one the indexer can follow.
     pub max_reorg_depth: u32,
 
     /// Maximum encoded blocks retained in the in-memory gRPC payload cache.
@@ -71,7 +71,7 @@ impl Default for Config {
             max_open_files: 256,
             zebra_grpc_url: None,
             live_poll_interval_secs: 5,
-            max_reorg_depth: 100,
+            max_reorg_depth: 1000,
             grpc_payload_cache_blocks: 32,
             grpc_payload_cache_bytes: 64 * 1024 * 1024,
             grpc_payload_wait_ms: 1_500,
