@@ -962,7 +962,17 @@ struct DatabaseSink {
     // 0 = not yet checked, 1 = migration 042 present, 2 = absent (pre-042 schema).
     coverage_schema: std::sync::atomic::AtomicU8,
     flush_control: FlushControl,
+    retention: Retention,
 }
+
+/// When this collector last ran the shared retention pass.
+#[derive(Default)]
+struct Retention(std::sync::Mutex<Option<Instant>>);
+
+/// Every collector repeats the retention pass, and one pass can take seconds on
+/// the primary, so each collector runs it at most this often.
+const RETENTION_INTERVAL: Duration = Duration::from_secs(60);
+const RETENTION_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The shared row every collector writes for a block. Committed on its own; a
 /// conflict only lowers `first_seen_at`, so the row is rewritten only when this
@@ -1122,6 +1132,7 @@ impl DatabaseSink {
             network: network.into(),
             coverage_schema: Default::default(),
             flush_control: FlushControl::from_env(),
+            retention: Default::default(),
         })
     }
 
@@ -1150,6 +1161,9 @@ impl DatabaseSink {
             Err(_) => (Ok(()), FlushOutcome::TimedOut),
         };
         let next = self.flush_control.record(outcome);
+        if matches!(outcome, FlushOutcome::Delivered(_)) {
+            self.prune_if_due().await;
+        }
         if outcome == FlushOutcome::TimedOut {
             tracing::warn!(
                 batch,
@@ -1163,7 +1177,7 @@ impl DatabaseSink {
     }
 
     /// Migration 042 adds coverage columns; older schemas keep the 035 contract.
-    async fn has_coverage_schema(&self) -> Result<bool, String> {
+    async fn has_coverage_schema(&self, conn: &mut sqlx::PgConnection) -> Result<bool, String> {
         use std::sync::atomic::Ordering;
         match self.coverage_schema.load(Ordering::Relaxed) {
             1 => return Ok(true),
@@ -1172,7 +1186,7 @@ impl DatabaseSink {
         }
         // Check the exact columns the UPDATE writes, on the relation it resolves to.
         let present: bool = sqlx::query_scalar(COVERAGE_COLUMNS_SQL)
-            .fetch_one(&self.pool)
+            .fetch_one(&mut *conn)
             .await
             .map_err(|_| "capture database identity")?;
         self.coverage_schema
@@ -1238,6 +1252,39 @@ impl DatabaseSink {
         })
     }
 
+    /// Keeps metadata and all losing-branch bodies; drops only redundant canonical
+    /// bodies beyond the indexer's 500-block automatic reorg horizon, 64 per pass.
+    /// Its own statement, skipping rows another collector is pruning.
+    async fn prune(&self) -> bool {
+        sqlx::query(CAPTURE_RETENTION_SQL)
+            .execute(&self.pool)
+            .await
+            .is_ok()
+    }
+
+    /// Runs the retention pass after a delivery has been acknowledged locally and
+    /// outside its time limit: a slow pass (2-4 s measured on the primary) used to
+    /// time out deliveries that had already committed, which were then resent.
+    async fn prune_if_due(&self) {
+        {
+            let mut last = self
+                .retention
+                .0
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if last.is_some_and(|at| at.elapsed() < RETENTION_INTERVAL) {
+                return;
+            }
+            *last = Some(Instant::now());
+        }
+        if !matches!(
+            tokio::time::timeout(RETENTION_TIMEOUT, self.prune()).await,
+            Ok(true)
+        ) {
+            tracing::debug!("capture retention pass skipped");
+        }
+    }
+
     /// Delivers at most `batch` records; returns how many.
     ///
     /// Every collector writes the same `captured_blocks` row for a block, so that
@@ -1248,6 +1295,11 @@ impl DatabaseSink {
     /// one transaction. A failure in between leaves a block row without this
     /// observer's receipt; the retry adds the receipt, and the block insert keeps
     /// the earliest `first_seen_at`.
+    ///
+    /// One connection is checked out for the whole delivery. Each statement run
+    /// straight on the pool cost about three round trips (measured from SGP1 on
+    /// 2026-11-10: 0.55 s apart against 0.18 s inside the transaction), which put
+    /// a single-record delivery at about 4.9 s, on SGP1's 5 s limit.
     async fn flush(&self, journal: &mut Journal, batch: usize) -> Result<usize, String> {
         let records: Vec<_> = journal.records.values().take(batch).cloned().collect();
         let delivered = records.len();
@@ -1256,11 +1308,16 @@ impl DatabaseSink {
         for evidence in &records {
             blocks.push(self.verified_block(journal, evidence).await?);
         }
+        let mut conn = self
+            .pool
+            .acquire()
+            .await
+            .map_err(|_| "capture database unavailable")?;
         // Prevent accidentally delivering one network's evidence into the other's DB.
         // Existing canonical genesis is the authority; an empty DB is not accepted.
         let genesis: Option<String> =
             sqlx::query_scalar("SELECT hash FROM blocks WHERE height = 0")
-                .fetch_optional(&self.pool)
+                .fetch_optional(&mut *conn)
                 .await
                 .map_err(|_| "capture database identity")?;
         let expected = if self.network == "mainnet" {
@@ -1282,7 +1339,7 @@ impl DatabaseSink {
                 .bind(&block.miner)
                 .bind(&block.tag)
                 .bind(&block.raw)
-                .execute(&self.pool)
+                .execute(&mut *conn)
                 .await
                 .map_err(|_| "capture database block")?;
         }
@@ -1297,8 +1354,8 @@ impl DatabaseSink {
             .bind(&self.observer).bind(&self.network).bind(journal.health.connected)
             .bind(journal.health.gaps as i64).bind((journal.records.len()-records.len()) as i32)
             .bind(&journal.health.last_gap).bind(journal.health.last_gap_at_ms.map(|v|v as f64))
-            .execute(&self.pool).await.map_err(|_| "capture database observer")?;
-        if self.has_coverage_schema().await? {
+            .execute(&mut *conn).await.map_err(|_| "capture database observer")?;
+        if self.has_coverage_schema(&mut conn).await? {
             let gaps = serde_json::to_string(&journal.health.recent_gaps)
                 .map_err(|_| "capture health encoding")?;
             sqlx::query("UPDATE block_capture_observers SET coverage_since=COALESCE(coverage_since, now()), unobserved_ms=$2, outage_since=to_timestamp($3::double precision/1000), recent_gaps=$4::jsonb, pending_bytes=$5, journal_max_bytes=$6 WHERE observer=$1")
@@ -1308,39 +1365,26 @@ impl DatabaseSink {
                 .bind(gaps)
                 .bind(i64::try_from(journal.bytes).unwrap_or(i64::MAX))
                 .bind(i64::try_from(journal.max_bytes).unwrap_or(i64::MAX))
-                .execute(&self.pool).await.map_err(|_| "capture database observer coverage")?;
+                .execute(&mut *conn).await.map_err(|_| "capture database observer coverage")?;
         }
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|_| "capture database unavailable")?;
-        sqlx::query("SET LOCAL statement_timeout = '3s'")
-            .execute(&mut *tx)
-            .await
-            .map_err(|_| "capture database setup")?;
-        sqlx::query("SET LOCAL lock_timeout = '500ms'")
-            .execute(&mut *tx)
-            .await
-            .map_err(|_| "capture database setup")?;
-        for evidence in &records {
-            sqlx::query("INSERT INTO block_capture_receipts (observer,hash,received_at,receipt_session,receipt_order) VALUES ($1,$2,to_timestamp($3::double precision/1000),$4,$5) ON CONFLICT(observer,hash) DO NOTHING")
-                .bind(&self.observer).bind(&evidence.hash).bind(evidence.received_at_ms as f64)
-                .bind(&evidence.receipt_session).bind(evidence.receipt_order.and_then(|v| i64::try_from(v).ok()))
-                .execute(&mut *tx).await.map_err(|_| "capture database receipt")?;
+        // A heartbeat with nothing to deliver has only its health to write.
+        if !records.is_empty() {
+            let mut tx = sqlx::Connection::begin(&mut *conn)
+                .await
+                .map_err(|_| "capture database unavailable")?;
+            sqlx::query("SELECT set_config('statement_timeout', '3s', true), set_config('lock_timeout', '500ms', true)")
+                .execute(&mut *tx)
+                .await
+                .map_err(|_| "capture database setup")?;
+            for evidence in &records {
+                sqlx::query("INSERT INTO block_capture_receipts (observer,hash,received_at,receipt_session,receipt_order) VALUES ($1,$2,to_timestamp($3::double precision/1000),$4,$5) ON CONFLICT(observer,hash) DO NOTHING")
+                    .bind(&self.observer).bind(&evidence.hash).bind(evidence.received_at_ms as f64)
+                    .bind(&evidence.receipt_session).bind(evidence.receipt_order.and_then(|v| i64::try_from(v).ok()))
+                    .execute(&mut *tx).await.map_err(|_| "capture database receipt")?;
+            }
+            tx.commit().await.map_err(|_| "capture database commit")?;
         }
-        tx.commit().await.map_err(|_| "capture database commit")?;
-        // Keep metadata and all losing-branch bodies. Drop only redundant canonical
-        // bodies beyond the indexer's 500-block automatic reorg horizon, 64 per pass.
-        // Housekeeping every collector repeats: its own statement, skipping rows
-        // another collector is pruning, and never a reason to resend evidence.
-        if sqlx::query(CAPTURE_RETENTION_SQL)
-            .execute(&self.pool)
-            .await
-            .is_err()
-        {
-            tracing::debug!("capture retention pass skipped");
-        }
+        drop(conn);
         // The saved resume heads precede file deletion. Crash replay is harmless:
         // primary keys preserve the original block and per-observer receipt.
         tokio::task::block_in_place(|| journal.save_health())?;
@@ -1632,9 +1676,17 @@ mod tests {
             .unwrap();
         let added_genesis: Option<i64> = sqlx::query_scalar("INSERT INTO blocks (height,hash,timestamp) VALUES (0,'00040fe8ec8471911baa1db1266ea15dd06b4a8a5c453883c000b031973dce08',0) ON CONFLICT DO NOTHING RETURNING height")
             .fetch_optional(&admin).await.unwrap();
+        // Counts checkouts of the delivery connection. Each one costs a distant
+        // observer extra round trips (a liveness check on the way out and back).
+        let checkouts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = checkouts.clone();
         let sink = std::sync::Arc::new(DatabaseSink {
             pool: PgPoolOptions::new()
                 .max_connections(1)
+                .before_acquire(move |_conn, _meta| {
+                    counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    Box::pin(async { Ok(true) })
+                })
                 .connect(&url)
                 .await
                 .unwrap(),
@@ -1642,6 +1694,7 @@ mod tests {
             network: "mainnet".into(),
             coverage_schema: Default::default(),
             flush_control: Default::default(),
+            retention: Default::default(),
         });
         let message = fixture();
         let evidence = decode(&message, 1000, Some("s".into())).unwrap();
@@ -1655,6 +1708,7 @@ mod tests {
             .execute(&mut *stall)
             .await
             .unwrap();
+        let checkouts_before = checkouts.load(std::sync::atomic::Ordering::Relaxed);
         let delivery = {
             let sink = sink.clone();
             tokio::spawn(async move {
@@ -1706,6 +1760,12 @@ mod tests {
 
         // Stalled or not, the delivery completes on retry with nothing lost.
         let (_, mut journal) = delivery.await.unwrap();
+        // Live 2026-11-10: five statements each checked the connection out again,
+        // about 22 round trips per record (4.9 s from SGP1, on its 5 s limit).
+        assert!(
+            checkouts.load(std::sync::atomic::Ordering::Relaxed) - checkouts_before <= 1,
+            "one delivery must check out its connection once"
+        );
         if !journal.records.is_empty() {
             sink.flush(&mut journal, MAX_FLUSH_BATCH).await.unwrap();
         }
@@ -1759,6 +1819,7 @@ mod tests {
             network: "mainnet".into(),
             coverage_schema: Default::default(),
             flush_control: Default::default(),
+            retention: Default::default(),
         };
         let message = fixture();
         let evidence = decode(&message, 1000, Some("session-one".into())).unwrap();
@@ -1822,6 +1883,8 @@ mod tests {
             .await
             .unwrap();
         sink.flush(&mut journal, MAX_FLUSH_BATCH).await.unwrap();
+        // Retention is its own pass now, run after a delivery is acknowledged.
+        assert!(sink.prune().await);
         let pruned: bool = sqlx::query_scalar(
             "SELECT raw_pruned AND raw_block IS NULL FROM captured_blocks WHERE hash=$1",
         )
@@ -1975,6 +2038,7 @@ mod tests {
             network: "mainnet".into(),
             coverage_schema: Default::default(),
             flush_control: Default::default(),
+            retention: Default::default(),
         };
         let mut journal = Journal::open(&path, "mainnet", 64 * 1024 * 1024).unwrap();
         journal.mark_disconnected("capture stream error", 10_000);
@@ -2032,6 +2096,7 @@ mod tests {
             network: "mainnet".into(),
             coverage_schema: Default::default(),
             flush_control: Default::default(),
+            retention: Default::default(),
         };
         let mut journal = Journal::open(&path, "mainnet", DEFAULT_JOURNAL_BYTES).unwrap();
         let message = fixture();
