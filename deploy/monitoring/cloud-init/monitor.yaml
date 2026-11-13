@@ -80,6 +80,7 @@ runcmd:
   - [sysctl, --system]
   - [systemctl, restart, ssh]
   - [systemctl, enable, --now, chrony]
+  - [systemctl, enable, prometheus-node-exporter]
   - [systemctl, restart, prometheus-node-exporter]
   - [install, -d, -m, "0755", /etc/zecblock-monitor, /opt/zecblock-monitor]
   - [sh, -c, "umask 077 && wg genkey | tee /etc/wireguard/monitor.key | wg pubkey > /etc/wireguard/monitor.pub"]

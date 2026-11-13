@@ -206,6 +206,9 @@ def install_host(plan, wg_ip):
         plan.copy(units / name, f'/etc/systemd/system/{name}')
     plan.run('install', '-d', '-m', '0755', TEXTFILE_DIR)
     plan.run('systemctl', 'daemon-reload')
+    # Enable as well as restart: the package is not always enabled at boot, and a
+    # host that reboots (unattended upgrades do) would come back without metrics.
+    plan.run('systemctl', 'enable', 'prometheus-node-exporter')
     plan.run('systemctl', 'restart', 'prometheus-node-exporter')
     plan.run('systemctl', 'enable', '--now', 'zecblock-host-textfile.timer')
     # Allow only the monitor, only on wg0. Does not change any other UFW rule.
