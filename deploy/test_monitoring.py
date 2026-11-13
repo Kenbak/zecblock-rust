@@ -238,6 +238,35 @@ class InstallerTests(unittest.TestCase):
                              capture_output=True, text=True, check=True).stdout
         self.assertIn('ufw allow in on wg0 from 10.77.0.10 to 10.77.0.2 port 9100', out)
 
+    def test_everything_the_installer_starts_is_enabled_at_boot(self):
+        # 2026-11-13: the observers rebooted for a kernel update and came back
+        # without node_exporter, which the host install had only restarted.
+        for mode in (['host', '--wg-ip', '10.77.0.2'], ['monitor']):
+            out = subprocess.run(['python3', str(ROOT / 'install.py'), *mode, '--dry-run'],
+                                 capture_output=True, text=True, check=True).stdout
+            enabled, started = set(), set()
+            for line in out.splitlines():
+                words = line.split()
+                if 'systemctl' not in words:
+                    continue
+                args = words[words.index('systemctl') + 1:]
+                units = {a for a in args[1:] if not a.startswith('-')}
+                if args[0] == 'enable':
+                    enabled |= units
+                    if '--now' in args:
+                        started |= units
+                elif args[0] in ('start', 'restart'):
+                    started |= units
+            self.assertTrue(started, mode)
+            self.assertEqual(started - enabled, set(), f'{mode}: started but not enabled at boot')
+
+    def test_cloud_init_enables_what_it_restarts(self):
+        text = (ROOT / 'cloud-init/monitor.yaml').read_text()
+        restarted = set(re.findall(r'\[systemctl, restart, ([\w@.-]+)\]', text)) - {'ssh'}
+        enabled = set(re.findall(r'\[systemctl, enable, (?:--now, )?([\w@.-]+)\]', text))
+        self.assertTrue(restarted)
+        self.assertEqual(restarted - enabled, set())
+
 
 def kit_files():
     return [p for p in ROOT.rglob('*') if p.is_file() and '__pycache__' not in p.parts]
