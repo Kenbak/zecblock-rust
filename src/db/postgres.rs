@@ -60,7 +60,7 @@ pub struct PostgresWriter {
 }
 
 impl PostgresWriter {
-    const BLOCK_WRITE_LOCK: i64 = 0x4349_5048_4552;
+    pub(crate) const BLOCK_WRITE_LOCK: i64 = 0x4349_5048_4552;
     // Namespace for per-address advisory locks taken in update_addresses_for_block.
     // Serializes concurrent writers (e.g. parallel backfill workers at different
     // heights) that touch the same address, without affecting writers touching

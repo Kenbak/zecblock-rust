@@ -4,6 +4,7 @@ pub mod capture_audit;
 pub mod grpc;
 pub mod grpc_tls;
 pub mod observations;
+pub mod observer_orphans;
 pub mod orphan_capture;
 pub mod postgres;
 pub mod rocks;
