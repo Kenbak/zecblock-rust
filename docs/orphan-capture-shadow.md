@@ -183,6 +183,9 @@ cipherscan-indexer archive-observer-orphans --limit 100000
 ```
 
 Ongoing: `deploy/cipherscan-observer-orphan-archive.service` runs
-`--watch --interval 60`. Its DB login needs SELECT on blocks, orphaned_blocks,
+`--watch --interval 60` from its own binary at
+`/opt/cipherscan-observer-orphan-archive/cipherscan-indexer`, separate from the
+collector's, with `/etc/cipherscan/observer-orphan-archive.env` (0600) holding
+`DATABASE_URL` and `NETWORK`. Its DB login needs SELECT on blocks, orphaned_blocks,
 transaction_outputs, orphaned_transaction_outputs, captured_blocks, and
 SELECT/INSERT/UPDATE/DELETE on the four `observer_orphan_*` tables.

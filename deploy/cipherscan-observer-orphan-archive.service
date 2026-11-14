@@ -8,7 +8,7 @@ StartLimitIntervalSec=0
 Type=simple
 EnvironmentFile=/etc/cipherscan/observer-orphan-archive.env
 Environment=TOKIO_WORKER_THREADS=1
-ExecStart=/opt/cipherscan-orphan-collector/cipherscan-indexer archive-observer-orphans --watch --interval 60 --limit 50
+ExecStart=/opt/cipherscan-observer-orphan-archive/cipherscan-indexer archive-observer-orphans --watch --interval 60 --limit 50
 Restart=on-failure
 RestartSec=30
 TimeoutStopSec=15
