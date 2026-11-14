@@ -93,6 +93,25 @@ enum Commands {
         observer: String,
     },
 
+    /// Parse retained observer-only orphan blocks into the observer_orphan_* archive.
+    /// Idempotent; never writes canonical, accounting or node-reorg tables.
+    ArchiveObserverOrphans {
+        /// Parse and count candidates without writing
+        #[arg(long)]
+        dry_run: bool,
+        /// Maximum blocks archived per pass
+        #[arg(long, default_value = "100")]
+        limit: u32,
+        /// Rebuild archives that already exist at the current version
+        #[arg(long)]
+        rearchive: bool,
+        /// Keep running, one pass every `interval` seconds
+        #[arg(long)]
+        watch: bool,
+        #[arg(long, default_value = "60")]
+        interval: u64,
+    },
+
     /// Show indexer status
     Status {
         /// Emit machine-readable JSON
@@ -419,6 +438,47 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 &observer,
             )
             .await?;
+        }
+        Commands::ArchiveObserverOrphans {
+            dry_run,
+            limit,
+            rearchive,
+            watch,
+            interval,
+        } => {
+            if limit == 0 || !(10..=86_400).contains(&interval) || (watch && dry_run) {
+                return Err("invalid observer orphan archive options".into());
+            }
+            let pool = sqlx::postgres::PgPoolOptions::new()
+                .max_connections(2)
+                .after_connect(|conn, _| {
+                    Box::pin(async move {
+                        sqlx::Executor::execute(
+                            conn,
+                            "SET statement_timeout = '60s'; SET lock_timeout = '5s'",
+                        )
+                        .await
+                        .map(|_| ())
+                    })
+                })
+                .connect(&config.database_url)
+                .await?;
+            let options = db::observer_orphans::ArchiveOptions {
+                dry_run,
+                limit,
+                rearchive,
+            };
+            loop {
+                match db::observer_orphans::archive_pass(&pool, config.network, options).await {
+                    Ok(summary) => println!("{}", serde_json::to_string(&summary)?),
+                    Err(error) if watch => tracing::warn!(%error, "observer orphan pass failed"),
+                    Err(error) => return Err(error.into()),
+                }
+                if !watch {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
+            }
         }
         Commands::Status { json } => {
             commands::status::show_status(&config, json).await?;

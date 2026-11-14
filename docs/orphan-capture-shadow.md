@@ -141,3 +141,48 @@ A competing block that never reached the node is invisible to both. Apply
 migration 042 before or after the binary; without it the collector keeps the
 035 contract and the audit waits. The audit uses the role's second allowed
 connection (`CONNECTION LIMIT 2`).
+
+## Observer-only orphan archive
+
+`archive-observer-orphans` parses retained observer-only orphan bodies into
+`observer_orphan_blocks`, `observer_orphan_transactions`,
+`observer_orphan_transaction_inputs` and `observer_orphan_transaction_outputs`
+(migration **045_observer_orphan_archive.sql**). An observer-only orphan is a
+captured block whose hash is in neither `blocks` nor `orphaned_blocks` while
+`blocks` holds a different hash at the same height: the same rule as the
+explorer's "Observers only" reorg list.
+
+These tables are deliberately separate from `orphaned_*`. Node-reorg archives,
+fork events, orphan rates, Ask analytics and open data keep their meaning; the
+columns match so block pages can render both. Moving captures into `orphaned_*`
+or any rate needs a separate release decision.
+
+- Parsing uses the indexer's block/transaction parser and re-verifies the hash,
+  full-input consumption and coinbase height of the captured bytes.
+- Transparent prevouts resolve from the same block, then canonical
+  `transaction_outputs`, then archived observer/node orphan outputs. An
+  unresolved prevout keeps its input value and address, the transaction's
+  `total_input` and `fee`, and the block's `total_fees` NULL. Amounts are
+  integer zatoshis.
+- `size` is the exact serialized block length. Final pool roots are NULL: raw
+  headers carry a commitment hash and the node cannot report roots for a block
+  it never adopted. `difficulty` is derived from the header bits.
+- Each block is replaced atomically under the shared block-write lock, after
+  re-checking observer-only status. A pass first deletes archives whose hash
+  became canonical or was archived by a node reorg, and refreshes
+  `canonical_hash`. Rows are keyed by hash so reruns are idempotent;
+  `--rearchive` rebuilds current-version archives, and a version bump rebuilds
+  older ones.
+- It never writes canonical chain, accounting or node-reorg tables.
+
+One-shot backfill (dry run first, then write):
+
+```sh
+cipherscan-indexer archive-observer-orphans --dry-run --limit 100000
+cipherscan-indexer archive-observer-orphans --limit 100000
+```
+
+Ongoing: `deploy/cipherscan-observer-orphan-archive.service` runs
+`--watch --interval 60`. Its DB login needs SELECT on blocks, orphaned_blocks,
+transaction_outputs, orphaned_transaction_outputs, captured_blocks, and
+SELECT/INSERT/UPDATE/DELETE on the four `observer_orphan_*` tables.

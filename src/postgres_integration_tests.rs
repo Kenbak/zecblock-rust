@@ -736,3 +736,262 @@ async fn rollback_at_the_node_limit_archives_every_orphaned_block() {
     clear_archives().await;
     cleanup(&pool, base, tip, &[miner]).await;
 }
+
+/// Observer-only orphan archive (migration 045): a real mainnet block captured
+/// by observers loses to a different canonical hash at its height.
+#[tokio::test]
+async fn observer_orphan_archive_is_idempotent_and_never_touches_node_archives() {
+    use crate::config::Network;
+    use crate::db::observer_orphans::{
+        archive_pass, external_prevouts, parse_captured_block, ArchiveOptions,
+    };
+    let _serial = ROLLBACK_TESTS.lock().await;
+    let pool = test_pool().await;
+    let w = writer().await;
+    let rows: Vec<serde_json::Value> =
+        serde_json::from_str(include_str!("../tests/fixtures/parser-blocks.json")).unwrap();
+    let fixture = rows
+        .iter()
+        .find(|r| r["network"] == "mainnet" && r["height"] == 3_428_142)
+        .unwrap();
+    let height = 3_428_142u32;
+    let hash = fixture["hash"].as_str().unwrap().to_owned();
+    let raw = hex::decode(fixture["hex"].as_str().unwrap()).unwrap();
+    let parsed = parse_captured_block(&raw, &hash, height, Network::Mainnet).unwrap();
+    let (seed_txid, seed_vout) = external_prevouts(&parsed.transactions)[0].clone();
+    let canonical = "ab".repeat(32);
+    let miner = "tTESTobserverorphanminer000000000";
+
+    let reset = || async {
+        sqlx::query("DELETE FROM observer_orphan_blocks WHERE hash = $1")
+            .bind(&hash)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM captured_blocks WHERE hash = $1")
+            .bind(&hash)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM transaction_outputs WHERE txid = $1")
+            .bind(&seed_txid)
+            .execute(&pool)
+            .await
+            .unwrap();
+        cleanup(&pool, height - 1, height, &[miner, "t1TESTseededprevout"]).await;
+    };
+    reset().await;
+
+    let tx = coinbase_tx(&"ac".repeat(32), height, &canonical, miner, 50_000_000);
+    w.batch_insert_with_header_and_flows(
+        height,
+        &canonical,
+        1_700_000_000,
+        &[tx],
+        &[],
+        &header(1_700_000_000),
+    )
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO captured_blocks (hash,network,height,previous_block_hash,timestamp,first_seen_at,raw_block) \
+         VALUES ($1,'mainnet',$2,$3,$4,now(),$5)",
+    )
+    .bind(&hash)
+    .bind(height as i64)
+    .bind(&parsed.header.previous_block_hash)
+    .bind(parsed.header.time as i64)
+    .bind(&raw)
+    .execute(&pool)
+    .await
+    .unwrap();
+    // One prevout is known canonically (written by the indexer's own path);
+    // exact integer zatoshis must carry over.
+    let seed_value = 9_007_199_254_740_993i64;
+    let mut parent = coinbase_tx(&seed_txid, height - 1, &"ad".repeat(32), miner, 0);
+    parent.vout = (0..=seed_vout)
+        .map(|n| TransparentOutput {
+            n,
+            value: if n == seed_vout { seed_value } else { 0 },
+            address: Some(
+                if n == seed_vout {
+                    "t1TESTseededprevout"
+                } else {
+                    miner
+                }
+                .to_string(),
+            ),
+            script_type: "pubkeyhash".to_string(),
+            script_pub_key: None,
+            pubkey_exposures: vec![],
+        })
+        .collect();
+    parent.vout_count = parent.vout.len() as u16;
+    parent.transparent_value_out = seed_value;
+    w.batch_insert_with_header_and_flows(
+        height - 1,
+        &"ad".repeat(32),
+        1_699_999_000,
+        &[parent],
+        &[],
+        &header(1_699_999_000),
+    )
+    .await
+    .unwrap();
+
+    let counts = || async {
+        let row: (i64, i64, i64, i64, i64) = sqlx::query_as(
+            "SELECT (SELECT count(*) FROM observer_orphan_blocks WHERE hash=$1),
+                    (SELECT count(*) FROM observer_orphan_transactions WHERE block_hash=$1),
+                    (SELECT count(*) FROM observer_orphan_transaction_inputs WHERE block_hash=$1),
+                    (SELECT count(*) FROM observer_orphan_transaction_outputs WHERE block_hash=$1),
+                    (SELECT count(*) FROM orphaned_blocks WHERE hash=$1)
+                  + (SELECT count(*) FROM orphaned_transactions WHERE block_hash=$1)",
+        )
+        .bind(&hash)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        row
+    };
+    let options = ArchiveOptions {
+        dry_run: true,
+        limit: 1_000,
+        rearchive: false,
+    };
+    let dry = archive_pass(&pool, Network::Mainnet, options)
+        .await
+        .unwrap();
+    assert!(dry.candidates >= 1 && dry.archived >= 1);
+    assert_eq!(counts().await, (0, 0, 0, 0, 0), "dry run writes nothing");
+
+    let first = archive_pass(
+        &pool,
+        Network::Mainnet,
+        ArchiveOptions {
+            dry_run: false,
+            ..options
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(first.failed, 0);
+    let inputs: i64 = parsed
+        .transactions
+        .iter()
+        .flat_map(|t| &t.vin)
+        .filter(|i| !i.is_coinbase)
+        .count() as i64;
+    let outputs: i64 = parsed
+        .transactions
+        .iter()
+        .map(|t| t.vout.len() as i64)
+        .sum();
+    let expected = (1, parsed.transactions.len() as i64, inputs, outputs, 0);
+    assert_eq!(counts().await, expected);
+
+    let block: (String, i32, i32, String, bool, Option<i64>) = sqlx::query_as(
+        "SELECT canonical_hash, size, transaction_count, source,
+                block_metadata->'final_sapling_root' = 'null'::jsonb,
+                (block_metadata->>'total_fees')::bigint
+         FROM observer_orphan_blocks WHERE hash=$1",
+    )
+    .bind(&hash)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(block.0, canonical);
+    assert_eq!(block.1 as usize, raw.len());
+    assert_eq!(block.2 as usize, parsed.transactions.len());
+    assert_eq!(block.3, "observer");
+    assert!(block.4);
+    let seeded: (Option<i64>, Option<String>) = sqlx::query_as(
+        "SELECT value, address FROM observer_orphan_transaction_inputs
+         WHERE block_hash=$1 AND prev_txid=$2 AND prev_vout=$3",
+    )
+    .bind(&hash)
+    .bind(&seed_txid)
+    .bind(seed_vout as i32)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        seeded,
+        (
+            Some(9_007_199_254_740_993),
+            Some("t1TESTseededprevout".into())
+        )
+    );
+    // Every other external prevout is unknown here: values and fees stay NULL.
+    let (null_values, unresolved, null_fee_txs): (i64, i32, i64) = sqlx::query_as(
+        "SELECT (SELECT count(*) FROM observer_orphan_transaction_inputs WHERE block_hash=$1 AND value IS NULL),
+                (SELECT unresolved_inputs FROM observer_orphan_blocks WHERE hash=$1),
+                (SELECT count(*) FROM observer_orphan_transactions
+                  WHERE block_hash=$1 AND NOT is_coinbase AND fee IS NULL AND total_input IS NULL)",
+    )
+    .bind(&hash)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(null_values, unresolved as i64);
+    assert!(unresolved > 0 && null_fee_txs > 0);
+    assert_eq!(
+        block.5, None,
+        "a block with an unknown fee has no fee total"
+    );
+
+    // Idempotent: nothing left to do, and a forced rebuild leaves identical rows.
+    let again = archive_pass(
+        &pool,
+        Network::Mainnet,
+        ArchiveOptions {
+            dry_run: false,
+            ..options
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(again.archived, 0);
+    let rebuilt = archive_pass(
+        &pool,
+        Network::Mainnet,
+        ArchiveOptions {
+            dry_run: false,
+            rearchive: true,
+            ..options
+        },
+    )
+    .await
+    .unwrap();
+    assert!(rebuilt.archived >= 1);
+    assert_eq!(counts().await, expected);
+
+    // Once the node archives the hash itself (a real reorg), the observer copy
+    // goes and the node row is untouched.
+    sqlx::query("INSERT INTO orphaned_blocks (height, hash, source) VALUES ($1,$2,'indexer')")
+        .bind(height as i64)
+        .bind(&hash)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let stale = archive_pass(
+        &pool,
+        Network::Mainnet,
+        ArchiveOptions {
+            dry_run: false,
+            ..options
+        },
+    )
+    .await
+    .unwrap();
+    assert!(stale.stale_archives >= 1);
+    assert_eq!(counts().await, (0, 0, 0, 0, 1));
+    let source: String = sqlx::query_scalar("SELECT source FROM orphaned_blocks WHERE hash=$1")
+        .bind(&hash)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(source, "indexer");
+
+    reset().await;
+}
