@@ -260,6 +260,24 @@ class InstallerTests(unittest.TestCase):
             self.assertTrue(started, mode)
             self.assertEqual(started - enabled, set(), f'{mode}: started but not enabled at boot')
 
+    def test_textfile_runs_before_node_exporter_at_boot(self):
+        # 2026-11-17: zecblock_host.prom persists across reboots, so node_exporter
+        # served the pre-reboot reboot marker until the timer first ran.
+        unit = (ROOT / 'systemd/zecblock-host-textfile.service').read_text()
+        self.assertRegex(unit, r'(?m)^Before=prometheus-node-exporter\.service$')
+        self.assertRegex(unit, r'(?m)^WantedBy=prometheus-node-exporter\.service$')
+        self.assertNotRegex(unit, r'(?m)^(Requires|BindsTo|RequiredBy)=')
+        for mode in (['host', '--wg-ip', '10.77.0.2'], ['monitor']):
+            out = subprocess.run(['python3', str(ROOT / 'install.py'), *mode, '--dry-run'],
+                                 capture_output=True, text=True, check=True).stdout
+            lines = out.splitlines()
+            enable = [i for i, l in enumerate(lines) if 'systemctl enable zecblock-host-textfile.service' in l]
+            starts = [i for i, l in enumerate(lines)
+                      if 'systemctl' in l and 'prometheus-node-exporter' in l and re.search(r' (restart|--now) ', l)]
+            self.assertTrue(enable, mode)
+            self.assertTrue(starts, mode)
+            self.assertLess(enable[0], starts[0], mode)
+
     def test_cloud_init_enables_what_it_restarts(self):
         text = (ROOT / 'cloud-init/monitor.yaml').read_text()
         restarted = set(re.findall(r'\[systemctl, restart, ([\w@.-]+)\]', text)) - {'ssh'}
@@ -309,6 +327,15 @@ class ConsistencyTests(unittest.TestCase):
             with self.subTest(alert=name):
                 self.assertRegex(block, r'labels: \{severity: (critical|warning|info|none)\}')
                 self.assertIn('summary:', block)
+
+    def test_reboot_alerts_ignore_textfile_older_than_boot(self):
+        blocks = dict((b.split('\n', 1)[0], b) for b in re.split(r'\n      - alert: ', self.RULES)[1:])
+        gated = [n for n, b in blocks.items() if 'zecblock_reboot_required' in b.split('annotations:')[0]]
+        self.assertEqual(sorted(gated), ['RebootPending', 'RebootPendingStale'])
+        for name in gated:
+            with self.subTest(alert=name):
+                self.assertIn('node_boot_time_seconds', blocks[name])
+                self.assertIn('zecblock_host\\\\.prom', blocks[name])
 
     def test_promtool_tests_reference_real_alerts(self):
         tests = (ROOT / 'prometheus/tests/fleet.test.yml').read_text()

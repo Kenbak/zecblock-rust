@@ -1,5 +1,11 @@
 [Unit]
 Description=ZecBlock host security/clock textfile metrics (CVE-2026-98432 nft, reboot, chrony)
+# zecblock_host.prom persists across reboots. Enabled via [Install] below, every
+# node_exporter start (boot included) first rewrites it, so the first scrape
+# never serves pre-reboot readings. Wants= only: a failed run does not block
+# node_exporter, and the alert rules also ignore a file older than the boot.
+Before=prometheus-node-exporter.service
+After=nftables.service chrony.service
 
 [Service]
 Type=oneshot
@@ -20,3 +26,6 @@ RestrictSUIDSGID=yes
 # nft needs netlink + CAP_NET_ADMIN to read the ruleset; chronyc uses its Unix socket.
 RestrictAddressFamilies=AF_UNIX AF_NETLINK AF_INET AF_INET6
 CapabilityBoundingSet=CAP_NET_ADMIN
+
+[Install]
+WantedBy=prometheus-node-exporter.service

@@ -193,8 +193,12 @@ alerts; `CaptureExporterDown` mutes capture/census alerts for that network;
   `DiskSpaceLow`/`Critical`, `DiskFillsWithin24h`, `MemoryLow`, `OomKill`.
 - Security: `Cve202698432StopgapMissing` (critical), `MptcpEnabled`
   (critical), `Cve202698432PacketsDropped` (info), `RebootPending` (info),
-  `RebootPendingStale` (> 3 days, warning). Observers reboot themselves at
-  04:00; production reboots stay owner-approved.
+  `RebootPendingStale` (> 3 days for 10 min, warning). Observers reboot
+  themselves at 04:00; production reboots stay owner-approved. Both reboot
+  alerts ignore a `zecblock_host.prom` older than `node_boot_time_seconds`,
+  and `zecblock-host-textfile.service` is enabled with
+  `WantedBy=`/`Before=prometheus-node-exporter.service`, so a reboot does not
+  replay the pre-reboot marker (the file lives on disk, not in `/run`).
 - Clock: `ClockOffsetHigh` (|offset| > 10 ms, the observer gate),
   `ClockUnsynchronised`, `ChronyDown`, `KernelClockUnsynchronised`.
 - Zakura: `ZakuraMetricsDown`, `ZakuraTipBehind` (> 3 blocks), `ZakuraTipStalled`
