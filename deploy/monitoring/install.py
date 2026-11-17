@@ -180,6 +180,9 @@ def install_monitor(plan):
     plan.copy(units / 'grafana-server.zecblock.conf', '/etc/systemd/system/grafana-server.service.d/zecblock.conf')
     plan.run('systemctl', 'daemon-reload')
     plan.run(OPT / 'prometheus/promtool', 'check', 'config', ETC / 'prometheus/prometheus.yml')
+    # The service (not just the timer) is enabled so node_exporter pulls in a
+    # fresh textfile run before it starts serving after a reboot.
+    plan.run('systemctl', 'enable', 'zecblock-host-textfile.service')
     plan.run('systemctl', 'enable', '--now', 'prometheus-node-exporter', 'zecblock-prometheus',
              'zecblock-host-textfile.timer')
 
@@ -206,6 +209,8 @@ def install_host(plan, wg_ip):
         plan.copy(units / name, f'/etc/systemd/system/{name}')
     plan.run('install', '-d', '-m', '0755', TEXTFILE_DIR)
     plan.run('systemctl', 'daemon-reload')
+    # Before node_exporter: its restart below then runs the textfile first.
+    plan.run('systemctl', 'enable', 'zecblock-host-textfile.service')
     # Enable as well as restart: the package is not always enabled at boot, and a
     # host that reboots (unattended upgrades do) would come back without metrics.
     plan.run('systemctl', 'enable', 'prometheus-node-exporter')

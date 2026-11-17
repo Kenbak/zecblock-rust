@@ -51,10 +51,14 @@ tests:
               title: "Blocked suspicious network packets"
 
   - name: stale reboot after three days
-    interval: 1h
+    interval: 1m
     input_series:
       - series: 'zecblock_reboot_required_since_timestamp_seconds{instance="10.77.0.22:9100",host="analytics"}'
-        values: '0x100'
+        values: '0x4400'
+      - series: 'node_textfile_mtime_seconds{instance="10.77.0.22:9100",host="analytics",file="/var/lib/prometheus/node-exporter/zecblock_host.prom"}'
+        values: '0+60x4400'
+      - series: 'node_boot_time_seconds{instance="10.77.0.22:9100",host="analytics"}'
+        values: '0x4400'
     alert_rule_test:
       - eval_time: 71h
         alertname: RebootPendingStale
@@ -68,6 +72,77 @@ tests:
               impact: "Security fixes have been installed but are not protecting the server yet."
               summary: "This server has been waiting 3d 1h 0m 0s for a restart to finish installing updates."
               title: "Restart overdue"
+
+  # 2026-11-17: zecblock_host.prom persists across reboots. After the primary
+  # rebooted, node_exporter served the pre-reboot reboot marker (set > 3 days
+  # earlier) until the textfile timer first ran, and RebootPendingStale fired.
+  # A file older than node_boot_time_seconds must never drive reboot alerts.
+  - name: pre-reboot textfile is ignored after a reboot
+    interval: 1m
+    input_series:
+      # Values from the file written before the reboot (marker 300000 s old).
+      - series: 'zecblock_reboot_required{instance="10.77.0.1:9100",host="primary"}'
+        values: '1x100'
+      - series: 'zecblock_reboot_required_since_timestamp_seconds{instance="10.77.0.1:9100",host="primary"}'
+        values: '-300000x100'
+      - series: 'node_textfile_mtime_seconds{instance="10.77.0.1:9100",host="primary",file="/var/lib/prometheus/node-exporter/zecblock_host.prom"}'
+        values: '0x100'
+      # Booted after the file was last written; the textfile run never happens here.
+      - series: 'node_boot_time_seconds{instance="10.77.0.1:9100",host="primary"}'
+        values: '30x100'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: RebootPendingStale
+        exp_alerts: []
+      - eval_time: 90m
+        alertname: RebootPendingStale
+        exp_alerts: []
+      - eval_time: 90m
+        alertname: RebootPending
+        exp_alerts: []
+      - eval_time: 15m
+        alertname: HostTextfileStale
+        exp_alerts:
+          - exp_labels: {severity: warning, instance: "10.77.0.1:9100", host: primary, file: "/var/lib/prometheus/node-exporter/zecblock_host.prom"}
+            exp_annotations:
+              action: "On the server, run: systemctl status zecblock-host-textfile.timer, and restart it if it has stopped."
+              impact: "The server is probably fine, but monitoring can no longer tell whether it is safe and up to date."
+              summary: "The small script that writes this server's health readings (security, reboot and clock status) has not updated them for 15m 0s."
+              title: "Health readings are out of date"
+
+  - name: reboot marker written this boot still alerts
+    interval: 1m
+    input_series:
+      - series: 'zecblock_reboot_required{instance="10.77.0.1:9100",host="primary"}'
+        values: '1x100'
+      - series: 'zecblock_reboot_required_since_timestamp_seconds{instance="10.77.0.1:9100",host="primary"}'
+        values: '-300000x100'
+      - series: 'node_textfile_mtime_seconds{instance="10.77.0.1:9100",host="primary",file="/var/lib/prometheus/node-exporter/zecblock_host.prom"}'
+        values: '0+60x100'
+      - series: 'node_boot_time_seconds{instance="10.77.0.1:9100",host="primary"}'
+        values: '-400000x100'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: RebootPendingStale
+        exp_alerts: []
+      - eval_time: 15m
+        alertname: RebootPendingStale
+        exp_alerts:
+          - exp_labels: {severity: warning, instance: "10.77.0.1:9100", host: primary}
+            exp_annotations:
+              action: "Plan a reboot today. For the main server, check nothing important is running first."
+              impact: "Security fixes have been installed but are not protecting the server yet."
+              summary: "This server has been waiting 3d 11h 35m 0s for a restart to finish installing updates."
+              title: "Restart overdue"
+      - eval_time: 65m
+        alertname: RebootPending
+        exp_alerts:
+          - exp_labels: {severity: info, instance: "10.77.0.1:9100", host: primary}
+            exp_annotations:
+              action: "Observers restart themselves at 04:00 UTC. For production servers, pick a quiet moment to reboot."
+              impact: "The server keeps running fine, but the new protections are not active yet."
+              summary: "Security updates were installed but only take effect after a restart."
+              title: "Restart needed to finish updates"
 
   - name: clock offset beyond the 10 ms observer gate
     interval: 1m

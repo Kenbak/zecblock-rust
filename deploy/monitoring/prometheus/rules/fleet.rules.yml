@@ -148,7 +148,13 @@ groups:
           impact: "This is the protection working. It can be random internet noise or someone probing for the kernel bug."
           action: "Nothing to do unless it keeps growing quickly."
       - alert: RebootPending
-        expr: zecblock_reboot_required == 1 or zecblock_kernel_newer_installed == 1
+        # Reboot readings count only once zecblock_host.prom has been rewritten
+        # since the host booted. The file persists on disk, so node_exporter
+        # serves the pre-reboot values until the first run after boot.
+        expr: >
+          (zecblock_reboot_required == 1 or zecblock_kernel_newer_installed == 1)
+          and on (instance)
+          (node_textfile_mtime_seconds{file=~"(.*/)?zecblock_host\\.prom"} - on (instance) node_boot_time_seconds >= 0)
         for: 1h
         labels: {severity: info}
         annotations:
@@ -159,7 +165,13 @@ groups:
       - alert: RebootPendingStale
         # Observers reboot automatically at 04:00; production hosts need an owner-approved reboot.
         # The since-timestamp exists only while /run/reboot-required exists.
-        expr: time() - zecblock_reboot_required_since_timestamp_seconds > 3 * 86400
+        # 2026-11-17: the primary's first scrape after its reboot served the
+        # pre-reboot file and fired this alert just after the HostDown recovery.
+        expr: >
+          time() - zecblock_reboot_required_since_timestamp_seconds > 3 * 86400
+          and on (instance)
+          (node_textfile_mtime_seconds{file=~"(.*/)?zecblock_host\\.prom"} - on (instance) node_boot_time_seconds >= 0)
+        for: 10m
         labels: {severity: warning}
         annotations:
           title: "Restart overdue"
