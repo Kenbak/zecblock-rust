@@ -47,3 +47,17 @@ Also includes the fee-bearing block 4,400,478 (two transactions).
 These are blocks from the staging fork, not official testnet/mainnet
 activation certification. The test compares node block hashes, all txids and exact
 serialization roundtrips through the release v1.5.0/parser 8 dependency.
+
+## Header commitment relabelled (2026-11-18)
+
+The baseline parser reported the header's 32-byte commitment field as
+`final_sapling_root`. That name is only correct from Sapling to Heartwood; since
+Heartwood the field is a chain-history or block-commitments hash. For mainnet
+block 2,000,000 the header field is `e11c1c4c…bf31` while the node's
+`finalsaplingroot` is `23cf0bd8…8e4b`.
+
+`parser-expected.json` now carries those same 18 captured values under
+`block_commitments`, and `final_sapling_root` is `null`: the header parser no
+longer reports any tree root, which only the node can supply. This was a key
+rename of the independently captured baseline, not a regeneration from the
+candidate; every other expected value is byte-for-byte unchanged.

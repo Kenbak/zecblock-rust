@@ -87,7 +87,8 @@ fn header(time: u64) -> ParsedBlockHeader {
         version: 4,
         previous_block_hash: "00".repeat(32),
         merkle_root: "11".repeat(32),
-        final_sapling_root: "22".repeat(32),
+        block_commitments: "44".repeat(32),
+        final_sapling_root: Some("22".repeat(32)),
         final_orchard_root: None,
         final_ironwood_root: None,
         time,
@@ -994,4 +995,231 @@ async fn observer_orphan_archive_is_idempotent_and_never_touches_node_archives()
     assert_eq!(source, "indexer");
 
     reset().await;
+}
+
+async fn stored_roots(
+    pool: &PgPool,
+    height: u32,
+) -> (Option<String>, Option<String>, Option<String>, i32) {
+    sqlx::query_as(
+        "SELECT final_sapling_root, final_orchard_root, final_ironwood_root, size FROM blocks WHERE height = $1",
+    )
+    .bind(height as i64)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+/// A replay that has no roots to offer (the RocksDB backfill, or the live
+/// path before its Ironwood root arrives) must not erase roots already stored
+/// for the same block, and the stored size must be the exact serialized size.
+#[tokio::test]
+async fn replay_without_roots_keeps_known_roots_and_size_is_exact() {
+    let pool = test_pool().await;
+    let w = writer().await;
+    let height = 96_500_001u32;
+    let miner = "tTESTrootsreplayminer0000000000000";
+    cleanup(&pool, height, height, &[miner]).await;
+
+    let hash = "a6".repeat(32);
+    let tx = coinbase_tx(&"c6".repeat(32), height, &hash, miner, 625_000_000);
+    let mut with_roots = header(1_700_000_000);
+    with_roots.final_sapling_root = Some("23".repeat(32));
+    with_roots.final_orchard_root = Some("13".repeat(32));
+    w.batch_insert_with_header_and_flows(
+        height,
+        &hash,
+        1_700_000_000,
+        std::slice::from_ref(&tx),
+        &[],
+        &with_roots,
+    )
+    .await
+    .expect("first index failed");
+
+    // Header (1487) + 1-byte transaction count + one 100-byte transaction.
+    let (sapling, orchard, ironwood, size) = stored_roots(&pool, height).await;
+    assert_eq!(size, 1_588);
+    assert_eq!(sapling, Some("23".repeat(32)));
+    assert_eq!(orchard, Some("13".repeat(32)));
+    assert_eq!(ironwood, None);
+
+    // The Ironwood root arrives after commit, guarded by hash and Orchard root.
+    let ironwood_root = "77".repeat(32);
+    let orchard_root = "13".repeat(32);
+    assert_eq!(
+        w.set_final_ironwood_root(
+            height,
+            &"ff".repeat(32),
+            &ironwood_root,
+            Some(&orchard_root)
+        )
+        .await
+        .unwrap(),
+        0,
+        "a root for another block hash must not be stored"
+    );
+    assert_eq!(
+        w.set_final_ironwood_root(height, &hash, &ironwood_root, Some(&"99".repeat(32)))
+            .await
+            .unwrap(),
+        0,
+        "a tree state that disagrees on the Orchard root must not be stored"
+    );
+    assert_eq!(
+        w.set_final_ironwood_root(height, &hash, &ironwood_root, Some(&orchard_root))
+            .await
+            .unwrap(),
+        1
+    );
+
+    let mut without_roots = header(1_700_000_000);
+    without_roots.final_sapling_root = None;
+    w.batch_insert_with_header_and_flows(height, &hash, 1_700_000_000, &[tx], &[], &without_roots)
+        .await
+        .expect("replay failed");
+    let (sapling, orchard, ironwood, _) = stored_roots(&pool, height).await;
+    assert_eq!(sapling, Some("23".repeat(32)));
+    assert_eq!(orchard, Some("13".repeat(32)));
+    assert_eq!(ironwood, Some(ironwood_root));
+
+    cleanup(&pool, height, height, &[miner]).await;
+}
+
+/// The root repair replaces a wrong Sapling root, fills Orchard, only fills
+/// (never clears) Ironwood, and ignores a row whose hash no longer matches.
+#[tokio::test]
+async fn block_root_repair_is_guarded_by_hash_and_idempotent() {
+    use crate::db::postgres::StoredBlockRoots;
+
+    let pool = test_pool().await;
+    let w = writer().await;
+    let (from, to) = (96_500_011u32, 96_500_012u32);
+    let miner = "tTESTrootsrepairminer0000000000000";
+    cleanup(&pool, from, to, &[miner]).await;
+
+    for (offset, height) in (from..=to).enumerate() {
+        let hash = format!("{:064x}", 0xb600 + offset);
+        let tx = coinbase_tx(
+            &format!("{:064x}", 0xc600 + offset),
+            height,
+            &hash,
+            miner,
+            1,
+        );
+        // What the old RocksDB backfill wrote: the header commitment as the
+        // "Sapling root" and nothing else.
+        let mut wrong = header(1_700_000_000);
+        wrong.final_sapling_root = Some("e1".repeat(32));
+        w.batch_insert_with_header_and_flows(height, &hash, 1_700_000_000, &[tx], &[], &wrong)
+            .await
+            .expect("index failed");
+    }
+
+    let stored = w.get_block_roots_in_range(from, to).await.unwrap();
+    assert_eq!(stored.len(), 2);
+    assert_eq!(stored[0].final_sapling_root, Some("e1".repeat(32)));
+
+    let repaired = |row: &StoredBlockRoots, hash: &str, ironwood: Option<&str>| StoredBlockRoots {
+        height: row.height,
+        hash: hash.to_string(),
+        final_sapling_root: Some("23".repeat(32)),
+        final_orchard_root: Some("13".repeat(32)),
+        final_ironwood_root: ironwood.map(|root| root.repeat(32)),
+    };
+    let updates = vec![
+        repaired(&stored[0], &stored[0].hash, Some("77")),
+        // Reorged since it was read: the hash guard must skip it.
+        repaired(&stored[1], &"ff".repeat(32), Some("77")),
+    ];
+    assert_eq!(w.update_block_roots(&updates).await.unwrap(), 1);
+    assert_eq!(
+        w.update_block_roots(&updates).await.unwrap(),
+        0,
+        "a second identical repair must change nothing"
+    );
+
+    let (sapling, orchard, ironwood, _) = stored_roots(&pool, from).await;
+    assert_eq!(sapling, Some("23".repeat(32)));
+    assert_eq!(orchard, Some("13".repeat(32)));
+    assert_eq!(ironwood, Some("77".repeat(32)));
+    let (sapling, orchard, _, _) = stored_roots(&pool, to).await;
+    assert_eq!(sapling, Some("e1".repeat(32)));
+    assert_eq!(orchard, None);
+
+    // A later pass with no Ironwood answer keeps the stored Ironwood root.
+    let keep = vec![repaired(&stored[0], &stored[0].hash, None)];
+    assert_eq!(w.update_block_roots(&keep).await.unwrap(), 0);
+    let (_, _, ironwood, _) = stored_roots(&pool, from).await;
+    assert_eq!(ironwood, Some("77".repeat(32)));
+
+    cleanup(&pool, from, to, &[miner]).await;
+}
+
+/// The size repair fixes a short size, is a no-op on a second run, reports
+/// without writing in dry-run mode, and leaves a block with incomplete
+/// transaction rows untouched.
+#[tokio::test]
+async fn block_size_repair_is_exact_idempotent_and_skips_incomplete_blocks() {
+    let pool = test_pool().await;
+    let w = writer().await;
+    let (from, to) = (96_500_021u32, 96_500_022u32);
+    let miner = "tTESTsizerepairminer00000000000000";
+    cleanup(&pool, from, to, &[miner]).await;
+
+    for (offset, height) in (from..=to).enumerate() {
+        let hash = format!("{:064x}", 0xd600 + offset);
+        let tx = coinbase_tx(
+            &format!("{:064x}", 0xe600 + offset),
+            height,
+            &hash,
+            miner,
+            1,
+        );
+        w.batch_insert_with_header_and_flows(
+            height,
+            &hash,
+            1_700_000_000,
+            &[tx],
+            &[],
+            &header(1_700_000_000),
+        )
+        .await
+        .expect("index failed");
+    }
+    // Reproduce the old writer: header + transactions, no count prefix.
+    sqlx::query("UPDATE blocks SET size = 1587 WHERE height BETWEEN $1 AND $2")
+        .bind(from as i64)
+        .bind(to as i64)
+        .execute(&pool)
+        .await
+        .unwrap();
+    // Make the second block's transaction rows incomplete.
+    sqlx::query("UPDATE transactions SET size = NULL WHERE block_height = $1")
+        .bind(to as i64)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let dry = w.repair_block_sizes(from, to, true).await.unwrap();
+    assert_eq!((dry.incorrect, dry.incomplete), (1, 1));
+    assert_eq!(
+        stored_roots(&pool, from).await.3,
+        1_587,
+        "dry run must not write"
+    );
+
+    let fixed = w.repair_block_sizes(from, to, false).await.unwrap();
+    assert_eq!((fixed.incorrect, fixed.incomplete), (1, 1));
+    assert_eq!(stored_roots(&pool, from).await.3, 1_588);
+    assert_eq!(
+        stored_roots(&pool, to).await.3,
+        1_587,
+        "a block with incomplete transaction rows must be left untouched"
+    );
+
+    let again = w.repair_block_sizes(from, to, false).await.unwrap();
+    assert_eq!((again.incorrect, again.incomplete), (0, 1));
+
+    cleanup(&pool, from, to, &[miner]).await;
 }

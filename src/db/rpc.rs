@@ -47,8 +47,94 @@ pub struct BlockInfo {
     pub finalsaplingroot: Option<String>,
     #[serde(default)]
     pub finalorchardroot: Option<String>,
+    /// Per-pool note commitment tree sizes. Zakura omits `ironwood` before
+    /// the Ironwood pool exists at this height.
     #[serde(default)]
-    pub finalironwoodroot: Option<String>,
+    pub trees: Option<BlockTrees>,
+}
+
+#[derive(Deserialize, Debug, Default)]
+pub struct BlockTrees {
+    #[serde(default)]
+    pub ironwood: Option<serde_json::Value>,
+}
+
+impl BlockInfo {
+    /// Whether the node reports an Ironwood note commitment tree at this
+    /// block. `getblock` exposes the Sapling and Orchard roots but no
+    /// Ironwood root; that one is only available from `z_gettreestate`.
+    pub fn has_ironwood_tree(&self) -> bool {
+        self.trees
+            .as_ref()
+            .is_some_and(|trees| trees.ironwood.is_some())
+    }
+}
+
+/// Final note commitment tree roots after one block, as reported by
+/// `z_gettreestate`. Encodings match `getblock`: Sapling in display
+/// (byte-reversed) order, Orchard and Ironwood in serialized order, which is
+/// also how transaction anchors are stored.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BlockRoots {
+    pub hash: String,
+    pub sapling: Option<String>,
+    pub orchard: Option<String>,
+    pub ironwood: Option<String>,
+}
+
+#[derive(Deserialize, Debug, Default)]
+struct TreeStateCommitments {
+    #[serde(default, rename = "finalRoot")]
+    final_root: Option<String>,
+}
+
+#[derive(Deserialize, Debug, Default)]
+struct TreeStatePool {
+    #[serde(default)]
+    commitments: TreeStateCommitments,
+}
+
+#[derive(Deserialize, Debug)]
+struct TreeStateResponse {
+    hash: String,
+    #[serde(default)]
+    sapling: TreeStatePool,
+    #[serde(default)]
+    orchard: TreeStatePool,
+    #[serde(default)]
+    ironwood: TreeStatePool,
+}
+
+/// A tree root is exactly 32 bytes of hex. Anything else is rejected rather
+/// than stored, so a malformed node answer cannot reach the database.
+pub fn normalize_root_hex(root: Option<String>) -> Result<Option<String>, String> {
+    match root {
+        None => Ok(None),
+        Some(root) => {
+            if root.len() == 64 && root.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                Ok(Some(root.to_ascii_lowercase()))
+            } else {
+                Err(format!("malformed tree root ({} characters)", root.len()))
+            }
+        }
+    }
+}
+
+impl TreeStateResponse {
+    fn into_roots(self, requested_hash: &str) -> Result<BlockRoots, String> {
+        if !self.hash.eq_ignore_ascii_case(requested_hash) {
+            return Err(format!(
+                "tree state hash mismatch: requested {requested_hash}, got {}",
+                self.hash
+            ));
+        }
+        Ok(BlockRoots {
+            hash: self.hash,
+            sapling: normalize_root_hex(self.sapling.commitments.final_root)?,
+            orchard: normalize_root_hex(self.orchard.commitments.final_root)?,
+            ironwood: normalize_root_hex(self.ironwood.commitments.final_root)?,
+        })
+    }
 }
 
 async fn read_cookie_auth(path: &std::path::Path) -> Result<(String, String), String> {
@@ -184,6 +270,15 @@ impl ZebraRpc {
         .await
     }
 
+    /// Final note commitment tree roots after the block with this hash.
+    /// Slower than `getblock` on Zakura, so keep it off the block write path.
+    pub async fn get_block_roots(&self, hash: &str) -> Result<BlockRoots, String> {
+        let response: TreeStateResponse = self
+            .call("z_gettreestate", vec![serde_json::json!(hash)])
+            .await?;
+        response.into_roots(hash)
+    }
+
     /// Get block info by height
     pub async fn get_block_by_height(&self, height: u64) -> Result<BlockInfo, String> {
         let hash = self.get_block_hash(height).await?;
@@ -315,5 +410,75 @@ mod cookie_rotation_tests {
         );
         tokio::fs::remove_file(&path).await.unwrap();
         assert!(read_cookie_auth(&path).await.is_err());
+    }
+}
+
+#[cfg(test)]
+mod block_root_tests {
+    use super::*;
+
+    #[test]
+    fn getblock_reports_an_ironwood_tree_only_when_the_node_lists_one() {
+        let with: BlockInfo = serde_json::from_value(serde_json::json!({
+            "hash": "aa".repeat(32), "time": 1,
+            "trees": {"sapling": {"size": 1}, "orchard": {"size": 2}, "ironwood": {"size": 3}},
+        }))
+        .unwrap();
+        assert!(with.has_ironwood_tree());
+
+        let without: BlockInfo = serde_json::from_value(serde_json::json!({
+            "hash": "aa".repeat(32), "time": 1,
+            "trees": {"sapling": {"size": 1}, "orchard": {"size": 2}},
+        }))
+        .unwrap();
+        assert!(!without.has_ironwood_tree());
+
+        let legacy: BlockInfo =
+            serde_json::from_value(serde_json::json!({"hash": "aa".repeat(32), "time": 1}))
+                .unwrap();
+        assert!(!legacy.has_ironwood_tree());
+    }
+
+    fn tree_state(ironwood: serde_json::Value) -> TreeStateResponse {
+        serde_json::from_value(serde_json::json!({
+            "hash": "aa".repeat(32),
+            "height": 3_587_000,
+            "time": 1,
+            "sapling": {"commitments": {"finalRoot": "22".repeat(32), "finalState": "00"}},
+            "orchard": {"commitments": {"finalRoot": "AB".repeat(32), "finalState": "00"}},
+            "ironwood": ironwood,
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn tree_state_roots_are_read_per_pool_and_lowercased() {
+        let roots = tree_state(serde_json::json!({
+            "commitments": {"finalRoot": "77".repeat(32), "finalState": "00"}
+        }))
+        .into_roots(&"aa".repeat(32))
+        .unwrap();
+        assert_eq!(roots.sapling, Some("22".repeat(32)));
+        assert_eq!(roots.orchard, Some("ab".repeat(32)));
+        assert_eq!(roots.ironwood, Some("77".repeat(32)));
+    }
+
+    #[test]
+    fn an_empty_ironwood_pool_has_no_root() {
+        let roots = tree_state(serde_json::json!({"commitments": {}}))
+            .into_roots(&"aa".repeat(32))
+            .unwrap();
+        assert_eq!(roots.ironwood, None);
+    }
+
+    #[test]
+    fn tree_state_for_another_block_or_with_a_malformed_root_is_refused() {
+        let other = tree_state(serde_json::json!({"commitments": {}}));
+        assert!(other.into_roots(&"bb".repeat(32)).is_err());
+
+        let malformed = tree_state(serde_json::json!({"commitments": {"finalRoot": "77"}}));
+        assert!(malformed.into_roots(&"aa".repeat(32)).is_err());
+        assert!(normalize_root_hex(Some("zz".repeat(32))).is_err());
+        assert_eq!(normalize_root_hex(None), Ok(None));
     }
 }
