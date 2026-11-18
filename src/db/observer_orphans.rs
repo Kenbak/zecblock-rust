@@ -117,12 +117,9 @@ pub fn parse_captured_block(
             "block {hash} height mismatch: captured {expected_height}, decoded {height}"
         ));
     }
-    let mut header = ParsedBlockHeader::from_chain_header(&block.header);
-    // Post-Heartwood headers carry a commitment hash, not the Sapling root, and
-    // the node cannot report final roots for a block it never adopted.
-    header.final_sapling_root = String::new();
-    header.final_orchard_root = None;
-    header.final_ironwood_root = None;
+    // The header parser never sets final roots, and the node cannot report
+    // them for a block it never adopted, so they stay absent.
+    let header = ParsedBlockHeader::from_chain_header(&block.header);
     let mut transactions = Vec::with_capacity(block.transactions.len());
     for transaction in block.transactions {
         let size = transaction.zcash_serialized_size();
@@ -641,7 +638,7 @@ mod tests {
         assert_eq!(parsed.size, raw.len());
         assert!(parsed.transactions[0].is_coinbase());
         assert!(parsed.header.final_orchard_root.is_none());
-        assert!(parsed.header.final_sapling_root.is_empty());
+        assert!(parsed.header.final_sapling_root.is_none());
         assert!(parse_captured_block(&raw, &hash, 3_428_141, Network::Mainnet).is_err());
         assert!(parse_captured_block(&raw, &"0".repeat(64), 3_428_142, Network::Mainnet).is_err());
         let mut trailing = raw.clone();

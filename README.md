@@ -94,6 +94,13 @@ INDEXER_HEALTH_TIMEOUT_SECONDS=45
 # Backfill specific range
 ./target/release/cipherscan-indexer backfill --from 3000000 --to 3100000
 
+# After a backfill: fetch block tree roots from the node (needs JSON-RPC).
+# RocksDB backfill does not write them; live mode does. Resumable.
+./target/release/cipherscan-indexer backfill-block-roots
+
+# Recompute block sizes from stored transactions (preview first)
+./target/release/cipherscan-indexer repair-block-sizes --dry-run
+
 # Follow chain tip in real-time
 ./target/release/cipherscan-indexer live
 

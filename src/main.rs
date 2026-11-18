@@ -212,6 +212,47 @@ enum Commands {
         batch: u32,
     },
 
+    /// Replace stored block tree roots (Sapling, Orchard) with the node's
+    /// answer and fill missing Ironwood roots. Idempotent and resumable;
+    /// needs JSON-RPC. Without --from it resumes from its own checkpoint.
+    BackfillBlockRoots {
+        /// Start height (default: resume after the last completed window)
+        #[arg(long)]
+        from: Option<u32>,
+
+        /// Stop height (default: indexed tip minus 100)
+        #[arg(long)]
+        to: Option<u32>,
+
+        /// Number of heights per window
+        #[arg(long, default_value = "500")]
+        batch: u32,
+
+        /// Report what would change without writing
+        #[arg(long)]
+        dry_run: bool,
+    },
+
+    /// Recompute blocks.size from stored transaction sizes (header +
+    /// transaction-count prefix + transactions). Idempotent.
+    RepairBlockSizes {
+        /// Start height
+        #[arg(long, default_value = "0")]
+        from: u32,
+
+        /// Stop height (default: indexed tip minus 100)
+        #[arg(long)]
+        to: Option<u32>,
+
+        /// Number of heights per window
+        #[arg(long, default_value = "5000")]
+        batch: u32,
+
+        /// Report what would change without writing
+        #[arg(long)]
+        dry_run: bool,
+    },
+
     /// Backfill anchor roots (orchard_anchor, ironwood_anchor) for existing
     /// transactions. Fetches raw tx bytes via RPC, parses with zakura-chain,
     /// and UPDATEs the transactions table.
@@ -525,6 +566,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Commands::BackfillMetadata { from, to, batch } => {
             commands::backfill::run_backfill_metadata(&config, from, to, batch).await?;
+        }
+        Commands::BackfillBlockRoots {
+            from,
+            to,
+            batch,
+            dry_run,
+        } => {
+            commands::block_repair::run_backfill_block_roots(&config, from, to, batch, dry_run)
+                .await?;
+        }
+        Commands::RepairBlockSizes {
+            from,
+            to,
+            batch,
+            dry_run,
+        } => {
+            commands::block_repair::run_repair_block_sizes(&config, from, to, batch, dry_run)
+                .await?;
         }
         Commands::BackfillAnchors { v6_only, batch } => {
             commands::backfill::run_backfill_anchors(&config, v6_only, batch).await?;

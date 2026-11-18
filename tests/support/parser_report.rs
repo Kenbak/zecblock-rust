@@ -47,7 +47,8 @@ pub fn report(fixtures: &Value) -> Result<Value, Box<dyn std::error::Error>> {
         reports.push(json!({
             "network":fixture["network"], "height":height, "hash":hash,
             "header": {"version":h.version,"previous_block_hash":h.previous_block_hash,
-                "merkle_root":h.merkle_root,"final_sapling_root":h.final_sapling_root,
+                "merkle_root":h.merkle_root,"block_commitments":h.block_commitments,
+                "final_sapling_root":h.final_sapling_root,
                 "final_orchard_root":h.final_orchard_root,"final_ironwood_root":h.final_ironwood_root,
                 "time":h.time,"bits":h.bits,"difficulty":h.difficulty,"nonce":h.nonce,"solution":h.solution},
             "transactions":transactions

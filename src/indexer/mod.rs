@@ -14,6 +14,28 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+/// Blocks waiting for their Ironwood root. Sized above the maximum reorg
+/// depth so an ordinary catch-up never overflows it.
+const IRONWOOD_ROOT_QUEUE_BLOCKS: usize = 4096;
+
+/// What the live writer committed for one block.
+#[derive(Debug)]
+struct LiveBlockOutcome {
+    tx_count: u32,
+    flow_count: u32,
+    /// The node has an Ironwood tree at this block, so its root still has to
+    /// be fetched from `z_gettreestate`.
+    needs_ironwood_root: bool,
+    final_orchard_root: Option<String>,
+}
+
+/// A committed block whose Ironwood root is fetched off the write path.
+struct IronwoodRootRequest {
+    height: u32,
+    hash: String,
+    final_orchard_root: Option<String>,
+}
+
 struct LiveSourceBlock {
     height: u32,
     hash: String,
@@ -627,7 +649,7 @@ impl Indexer {
         height: u32,
         block_hash: &str,
         raw_block: &[u8],
-    ) -> Result<(u32, u32), String> {
+    ) -> Result<LiveBlockOutcome, String> {
         let (mut transactions, mut header) =
             self.parse_encoded_block(height, block_hash, raw_block)?;
         let flows = self.resolve_live_prevouts(rpc, &mut transactions).await?;
@@ -642,9 +664,21 @@ impl Indexer {
                 block_info.hash
             ));
         }
-        header.final_sapling_root = block_info.finalsaplingroot.unwrap_or_default();
-        header.final_orchard_root = block_info.finalorchardroot;
-        header.final_ironwood_root = block_info.finalironwoodroot;
+        let needs_ironwood_root = block_info.has_ironwood_tree();
+        // A root the node reports in an unexpected shape is stored as NULL
+        // (unavailable) and can be repaired later; it must not stall
+        // canonical indexing.
+        let checked_root = |pool: &str, root: Option<String>| {
+            crate::db::rpc::normalize_root_hex(root).unwrap_or_else(|error| {
+                tracing::warn!(height, pool, %error, "node reported an unusable tree root");
+                None
+            })
+        };
+        header.final_sapling_root = checked_root("sapling", block_info.finalsaplingroot);
+        header.final_orchard_root = checked_root("orchard", block_info.finalorchardroot);
+        // `getblock` has no Ironwood root. It is filled after commit from
+        // `z_gettreestate`, which is too slow for the block write path.
+        header.final_ironwood_root = None;
         header.difficulty = block_info.difficulty;
 
         let (_, flow_count) = self
@@ -669,7 +703,52 @@ impl Indexer {
             );
         }
 
-        Ok((transactions.len() as u32, flow_count as u32))
+        Ok(LiveBlockOutcome {
+            tx_count: transactions.len() as u32,
+            flow_count: flow_count as u32,
+            needs_ironwood_root,
+            final_orchard_root: header.final_orchard_root,
+        })
+    }
+
+    /// Fetch Ironwood roots for committed blocks, one node request at a time.
+    /// A failure leaves the root NULL (unavailable); `backfill-block-roots`
+    /// fills any that are missed. Canonical indexing never waits on this.
+    async fn fill_ironwood_roots(
+        rpc: crate::db::ZebraRpc,
+        postgres: PostgresWriter,
+        mut requests: tokio::sync::mpsc::Receiver<IronwoodRootRequest>,
+    ) {
+        while let Some(request) = requests.recv().await {
+            let roots = match rpc.get_block_roots(&request.hash).await {
+                Ok(roots) => roots,
+                Err(error) => {
+                    tracing::warn!(height = request.height, %error, "Ironwood root unavailable");
+                    continue;
+                }
+            };
+            let Some(ironwood_root) = roots.ironwood else {
+                continue;
+            };
+            if roots.orchard != request.final_orchard_root {
+                tracing::warn!(
+                    height = request.height,
+                    "tree state disagrees with the block's Orchard root; Ironwood root not stored"
+                );
+                continue;
+            }
+            if let Err(error) = postgres
+                .set_final_ironwood_root(
+                    request.height,
+                    &request.hash,
+                    &ironwood_root,
+                    request.final_orchard_root.as_deref(),
+                )
+                .await
+            {
+                tracing::warn!(height = request.height, %error, "Ironwood root write failed");
+            }
+        }
     }
 
     /// RPC fallback for live mode: one raw-block request and one metadata
@@ -679,7 +758,7 @@ impl Indexer {
         rpc: &crate::db::ZebraRpc,
         height: u32,
         block_hash: &str,
-    ) -> Result<(u32, u32), String> {
+    ) -> Result<LiveBlockOutcome, String> {
         let raw_hex = rpc.get_raw_block_hex(block_hash).await?;
         let raw_block =
             hex::decode(raw_hex).map_err(|e| format!("Invalid raw block hex at {height}: {e}"))?;
@@ -846,6 +925,14 @@ impl Indexer {
                 }
             });
         }
+
+        let (ironwood_root_sender, ironwood_root_receiver) =
+            tokio::sync::mpsc::channel(IRONWOOD_ROOT_QUEUE_BLOCKS);
+        tokio::spawn(Self::fill_ironwood_roots(
+            rpc.clone(),
+            self.postgres.clone(),
+            ironwood_root_receiver,
+        ));
 
         let grpc_url = self.config.zebra_grpc_url.clone();
         let mut grpc_stream: Option<Streaming<BlockHashAndHeight>> = None;
@@ -1029,7 +1116,26 @@ impl Indexer {
                     };
 
                     match result {
-                        Ok((tx_count, flow_count)) => {
+                        Ok(LiveBlockOutcome {
+                            tx_count,
+                            flow_count,
+                            needs_ironwood_root,
+                            final_orchard_root,
+                        }) => {
+                            if needs_ironwood_root
+                                && ironwood_root_sender
+                                    .try_send(IronwoodRootRequest {
+                                        height,
+                                        hash: source_block.hash.clone(),
+                                        final_orchard_root,
+                                    })
+                                    .is_err()
+                            {
+                                tracing::warn!(
+                                    height,
+                                    "Ironwood root queue full; run backfill-block-roots for this height"
+                                );
+                            }
                             let processing_ms = ingest_started.elapsed().as_millis() as u64;
                             let elapsed_ms =
                                 source_block.source_elapsed_ms.saturating_add(processing_ms);

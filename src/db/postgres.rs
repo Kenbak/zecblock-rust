@@ -54,7 +54,56 @@ pub struct BlockWriteResult {
     pub metrics: BlockWriteMetrics,
 }
 
+/// Serialized size of a mainnet/testnet block header: 140 fixed bytes plus a
+/// 3-byte length prefix and the 1344-byte Equihash (200, 9) solution.
+const BLOCK_HEADER_BYTES: i32 = 1487;
+
+/// Bytes used by the CompactSize transaction count that sits between the
+/// header and the transactions.
+fn compact_size_len(count: usize) -> i32 {
+    match count {
+        0..=252 => 1,
+        253..=0xffff => 3,
+        0x1_0000..=0xffff_ffff => 5,
+        _ => 9,
+    }
+}
+
+/// Exact serialized block size: header, transaction-count prefix, then every
+/// transaction. `None` on overflow.
+pub(crate) fn serialized_block_size(
+    transaction_bytes: i32,
+    transaction_count: usize,
+) -> Option<i32> {
+    BLOCK_HEADER_BYTES
+        .checked_add(compact_size_len(transaction_count))?
+        .checked_add(transaction_bytes)
+}
+
+/// Roots stored for one canonical block, read for repair.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredBlockRoots {
+    pub height: u32,
+    pub hash: String,
+    pub final_sapling_root: Option<String>,
+    pub final_orchard_root: Option<String>,
+    pub final_ironwood_root: Option<String>,
+}
+
+/// `(height, hash, sapling, orchard, ironwood)` as selected from `blocks`.
+type BlockRootsRow = (i64, String, Option<String>, Option<String>, Option<String>);
+
+/// Result of one block-size repair window.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BlockSizeRepair {
+    /// Rows whose stored size differed from the exact size.
+    pub incorrect: u64,
+    /// Blocks skipped because their transaction rows are incomplete.
+    pub incomplete: u64,
+}
+
 /// PostgreSQL connection and writer
+#[derive(Clone)]
 pub struct PostgresWriter {
     pool: PgPool,
 }
@@ -336,16 +385,14 @@ impl PostgresWriter {
         let total_fees = block_total_fees(transactions)
             .map_err(|error| sqlx::Error::Protocol(error.to_string()))?;
 
-        // Block size = sum of all tx sizes + header size (~1487 bytes for Zcash)
-        // Header: 4 (version) + 32 (prev_hash) + 32 (merkle) + 32 (reserved) + 4 (time)
-        //       + 4 (bits) + 32 (nonce) + 3 (solution length) + 1344 (solution) = ~1487
-        const HEADER_SIZE: i32 = 1487;
+        // Block size = header + CompactSize transaction count + transactions.
         let tx_sizes = transactions
             .iter()
-            .try_fold(0i32, |total, tx| total.checked_add(tx.size as i32))
+            .try_fold(0i32, |total, tx| {
+                total.checked_add(i32::try_from(tx.size).ok()?)
+            })
             .ok_or_else(|| sqlx::Error::Protocol("block size overflow".to_string()))?;
-        let block_size = tx_sizes
-            .checked_add(HEADER_SIZE)
+        let block_size = serialized_block_size(tx_sizes, transactions.len())
             .ok_or_else(|| sqlx::Error::Protocol("block size overflow".to_string()))?;
 
         // Miner address = first transparent coinbase output, except the known
@@ -391,8 +438,15 @@ impl PostgresWriter {
                 total_fees = EXCLUDED.total_fees,
                 version = EXCLUDED.version,
                 merkle_root = EXCLUDED.merkle_root,
-                final_sapling_root = EXCLUDED.final_sapling_root,
-                final_orchard_root = EXCLUDED.final_orchard_root,
+                -- Roots come only from the node. A replay of the same block
+                -- that has no root to offer (RocksDB backfill, or the Ironwood
+                -- root that is filled after commit) must not erase a known one.
+                final_sapling_root = CASE WHEN blocks.hash = EXCLUDED.hash
+                    THEN COALESCE(EXCLUDED.final_sapling_root, blocks.final_sapling_root)
+                    ELSE EXCLUDED.final_sapling_root END,
+                final_orchard_root = CASE WHEN blocks.hash = EXCLUDED.hash
+                    THEN COALESCE(EXCLUDED.final_orchard_root, blocks.final_orchard_root)
+                    ELSE EXCLUDED.final_orchard_root END,
                 bits = EXCLUDED.bits,
                 nonce = EXCLUDED.nonce,
                 solution = EXCLUDED.solution,
@@ -401,7 +455,9 @@ impl PostgresWriter {
                 size = EXCLUDED.size,
                 miner_address = EXCLUDED.miner_address,
                 coinbase_hex = EXCLUDED.coinbase_hex,
-                final_ironwood_root = EXCLUDED.final_ironwood_root
+                final_ironwood_root = CASE WHEN blocks.hash = EXCLUDED.hash
+                    THEN COALESCE(EXCLUDED.final_ironwood_root, blocks.final_ironwood_root)
+                    ELSE EXCLUDED.final_ironwood_root END
             "#,
         )
         .bind(height as i64)
@@ -1701,6 +1757,174 @@ impl PostgresWriter {
         Ok(())
     }
 
+    /// Store the Ironwood root for one canonical block. The hash guard makes a
+    /// late answer for a block that was since reorged away a no-op, and the
+    /// Orchard guard refuses a tree state that disagrees with the root the
+    /// node already reported for this block through `getblock`.
+    pub async fn set_final_ironwood_root(
+        &self,
+        height: u32,
+        hash: &str,
+        ironwood_root: &str,
+        orchard_root: Option<&str>,
+    ) -> Result<u64, sqlx::Error> {
+        let result = sqlx::query(
+            r#"
+            UPDATE blocks SET final_ironwood_root = $3
+            WHERE height = $1 AND hash = $2
+              AND final_orchard_root IS NOT DISTINCT FROM $4
+              AND final_ironwood_root IS DISTINCT FROM $3
+            "#,
+        )
+        .bind(height as i64)
+        .bind(hash)
+        .bind(ironwood_root)
+        .bind(orchard_root)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
+    }
+
+    /// Canonical blocks in an inclusive height window with their stored roots.
+    pub async fn get_block_roots_in_range(
+        &self,
+        from: u32,
+        to: u32,
+    ) -> Result<Vec<StoredBlockRoots>, sqlx::Error> {
+        let rows: Vec<BlockRootsRow> = sqlx::query_as(
+            r#"
+                SELECT height, hash, final_sapling_root, final_orchard_root, final_ironwood_root
+                FROM blocks
+                WHERE height BETWEEN $1 AND $2
+                ORDER BY height
+                "#,
+        )
+        .bind(from as i64)
+        .bind(to as i64)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|(height, hash, sapling, orchard, ironwood)| {
+                Ok(StoredBlockRoots {
+                    height: u32::try_from(height).map_err(|_| {
+                        sqlx::Error::Protocol(format!("block height {height} out of range"))
+                    })?,
+                    hash,
+                    final_sapling_root: sapling,
+                    final_orchard_root: orchard,
+                    final_ironwood_root: ironwood,
+                })
+            })
+            .collect()
+    }
+
+    /// Write node-reported roots for blocks that still match by height and
+    /// hash. Sapling and Orchard are replaced with the node's answer; the
+    /// Ironwood root is only ever filled, never cleared.
+    pub async fn update_block_roots(
+        &self,
+        updates: &[StoredBlockRoots],
+    ) -> Result<u64, sqlx::Error> {
+        if updates.is_empty() {
+            return Ok(0);
+        }
+        let heights: Vec<i64> = updates.iter().map(|row| row.height as i64).collect();
+        let hashes: Vec<&str> = updates.iter().map(|row| row.hash.as_str()).collect();
+        let sapling: Vec<Option<&str>> = updates
+            .iter()
+            .map(|row| row.final_sapling_root.as_deref())
+            .collect();
+        let orchard: Vec<Option<&str>> = updates
+            .iter()
+            .map(|row| row.final_orchard_root.as_deref())
+            .collect();
+        let ironwood: Vec<Option<&str>> = updates
+            .iter()
+            .map(|row| row.final_ironwood_root.as_deref())
+            .collect();
+        let result = sqlx::query(
+            r#"
+            UPDATE blocks b SET
+                final_sapling_root = u.sapling,
+                final_orchard_root = u.orchard,
+                final_ironwood_root = COALESCE(u.ironwood, b.final_ironwood_root)
+            FROM UNNEST($1::bigint[], $2::text[], $3::text[], $4::text[], $5::text[])
+                AS u(height, hash, sapling, orchard, ironwood)
+            WHERE b.height = u.height AND b.hash = u.hash
+              AND (b.final_sapling_root IS DISTINCT FROM u.sapling
+                OR b.final_orchard_root IS DISTINCT FROM u.orchard
+                OR b.final_ironwood_root IS DISTINCT FROM COALESCE(u.ironwood, b.final_ironwood_root))
+            "#,
+        )
+        .bind(&heights)
+        .bind(&hashes)
+        .bind(&sapling)
+        .bind(&orchard)
+        .bind(&ironwood)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
+    }
+
+    /// Recompute `blocks.size` for an inclusive height window from the stored
+    /// transaction sizes. Idempotent. A block whose transaction rows are not
+    /// all present with a size is left untouched and counted as incomplete.
+    pub async fn repair_block_sizes(
+        &self,
+        from: u32,
+        to: u32,
+        dry_run: bool,
+    ) -> Result<BlockSizeRepair, sqlx::Error> {
+        const EXACT_SIZES: &str = r#"
+            SELECT b.height,
+                   b.size AS stored_size,
+                   b.transaction_count,
+                   COUNT(t.size) AS sized_transactions,
+                   $3::bigint
+                     + CASE WHEN b.transaction_count < 253 THEN 1
+                            WHEN b.transaction_count <= 65535 THEN 3
+                            ELSE 5 END
+                     + COALESCE(SUM(t.size), 0) AS exact_size
+            FROM blocks b
+            LEFT JOIN transactions t
+              ON t.block_height = b.height AND t.block_hash = b.hash
+            WHERE b.height BETWEEN $1 AND $2
+            GROUP BY b.height, b.size, b.transaction_count
+        "#;
+        let (incorrect, incomplete): (i64, i64) = sqlx::query_as(&format!(
+            r#"WITH exact AS ({EXACT_SIZES})
+               SELECT COUNT(*) FILTER (WHERE sized_transactions = transaction_count
+                                         AND stored_size IS DISTINCT FROM exact_size),
+                      COUNT(*) FILTER (WHERE sized_transactions IS DISTINCT FROM transaction_count)
+               FROM exact"#
+        ))
+        .bind(from as i64)
+        .bind(to as i64)
+        .bind(BLOCK_HEADER_BYTES as i64)
+        .fetch_one(&self.pool)
+        .await?;
+        if !dry_run && incorrect > 0 {
+            sqlx::query(&format!(
+                r#"WITH exact AS ({EXACT_SIZES})
+                   UPDATE blocks b SET size = exact.exact_size::integer
+                   FROM exact
+                   WHERE b.height = exact.height
+                     AND exact.sized_transactions = exact.transaction_count
+                     AND exact.exact_size <= 2147483647
+                     AND b.size IS DISTINCT FROM exact.exact_size"#
+            ))
+            .bind(from as i64)
+            .bind(to as i64)
+            .bind(BLOCK_HEADER_BYTES as i64)
+            .execute(&self.pool)
+            .await?;
+        }
+        Ok(BlockSizeRepair {
+            incorrect: incorrect.max(0) as u64,
+            incomplete: incomplete.max(0) as u64,
+        })
+    }
+
     /// Batch-update anchor roots for transactions that were indexed before anchors were stored.
     /// Used by the backfill-anchors subcommand.
     pub async fn batch_update_anchors(
@@ -1855,6 +2079,20 @@ mod integrity_write_tests {
             Some("100")
         );
         writer.pool.close().await;
+    }
+
+    #[test]
+    fn block_size_counts_the_transaction_count_prefix() {
+        use super::serialized_block_size;
+        // Mainnet 3,587,000: one 159-byte coinbase transaction.
+        assert_eq!(serialized_block_size(159, 1), Some(1_647));
+        // Mainnet 2,000,000: 44 transactions totalling 219,687 bytes; the
+        // serialized block is 221,175 bytes.
+        assert_eq!(serialized_block_size(219_687, 44), Some(221_175));
+        // 253 or more transactions need a 3-byte CompactSize.
+        assert_eq!(serialized_block_size(0, 252), Some(1_488));
+        assert_eq!(serialized_block_size(0, 253), Some(1_490));
+        assert_eq!(serialized_block_size(i32::MAX, 1), None);
     }
 
     #[test]

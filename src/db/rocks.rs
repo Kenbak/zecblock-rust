@@ -307,7 +307,15 @@ pub struct ParsedBlockHeader {
     pub version: i32,
     pub previous_block_hash: String,
     pub merkle_root: String,
-    pub final_sapling_root: String,
+    /// The header's 32-byte commitment field in display order: reserved
+    /// before Sapling, the Sapling root from Sapling to Heartwood, and a
+    /// chain-history or block-commitments hash since. Not a tree root.
+    pub block_commitments: String,
+    /// Note commitment tree roots after this block. They are node state, not
+    /// header fields: since Heartwood the header's 32-byte commitment field is
+    /// a chain-history/block-commitments hash, not the Sapling root. `None`
+    /// means "not supplied by the node", never "derived from the header".
+    pub final_sapling_root: Option<String>,
     pub final_orchard_root: Option<String>,
     pub final_ironwood_root: Option<String>,
     pub time: u64,
@@ -378,7 +386,8 @@ impl ParsedBlockHeader {
             version,
             previous_block_hash: display_hash(header.previous_block_hash.0),
             merkle_root: display_hash(header.merkle_root.0),
-            final_sapling_root: display_hash(header.commitment_bytes.0),
+            block_commitments: display_hash(header.commitment_bytes.0),
+            final_sapling_root: None,
             final_orchard_root: None,
             final_ironwood_root: None,
             time: header.time.timestamp() as u64,
