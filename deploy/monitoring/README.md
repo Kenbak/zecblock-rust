@@ -57,8 +57,8 @@ in the wiki host table when configured. Never reuse an address or host name.
 |---|---|---|
 | 10.77.0.1 | primary | mainnet primary, observer `local-node`, PostgreSQL hub |
 | 10.77.0.10 | monitor | this stack |
-| 10.77.0.20 | standby | passive standby |
-| 10.77.0.21 | testnet | testnet |
+| 10.77.0.20 | standby | passive standby (live since 2026-11-25) |
+| 10.77.0.21 | testnet | testnet (live since 2026-11-25) |
 | 10.77.0.22 | analytics | analytics (live since 2026-11-25) |
 | 10.77.0.23 | crosslink | Crosslink |
 | 10.77.0.24 | cipherpay-mainnet | CipherPay |
