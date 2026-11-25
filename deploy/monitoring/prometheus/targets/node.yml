@@ -15,8 +15,8 @@
 #  labels: {host: standby, role: mainnet-standby, provider: hetzner, region: hel1}
 #- targets: ['10.77.0.21:9100']
 #  labels: {host: testnet, role: testnet, provider: hetzner, region: hel1}
-#- targets: ['10.77.0.22:9100']
-#  labels: {host: analytics, role: analytics, provider: hetzner, region: hel1}
+- targets: ['10.77.0.22:9100']
+  labels: {host: analytics, role: analytics, provider: hetzner, region: hel1}
 #- targets: ['10.77.0.23:9100']
 #  labels: {host: crosslink, role: crosslink, provider: digitalocean, region: unknown}
 #- targets: ['10.77.0.24:9100']
